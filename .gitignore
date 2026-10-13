@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Local projects, preferences, and session logs
+data/
+
+# PyInstaller output
+/build/
+/dist/
+/SyncEngine.spec
+/scripts/build/
+/.runtime/
+/scripts/dist/
