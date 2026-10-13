@@ -52,6 +52,7 @@ def run_gui(options):
     from sync_engine_controller import SyncEngineController
     from sync_engine_model import PlanStore
     from sync_engine_qt import QtGui, QtWidgets, application_exec
+    from sync_engine_startup import set_windows_app_user_model_id
     from sync_engine_style import STYLESHEET, icon_path
     from sync_engine_view import SyncEngineView
 
@@ -61,6 +62,7 @@ def run_gui(options):
     if input_path:
         initial_plan, is_action = load_input(input_path)
         automatic = bool(options.run or is_action)
+    set_windows_app_user_model_id()
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([sys.argv[0]])
     application.setApplicationName("SyncEngine")
     application.setOrganizationName("SyncEngine")

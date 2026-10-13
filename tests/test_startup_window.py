@@ -5,12 +5,17 @@ import json
 import os
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sync_engine"))
-from sync_engine_startup import _hidden_process_options, _startup_environment
+import sync_engine_startup
+from sync_engine_startup import (
+    _hidden_process_options, _startup_environment, set_windows_app_user_model_id,
+)
 
 
 def available_qt_binding():
@@ -26,6 +31,23 @@ def available_qt_binding():
 
 
 QT_BINDING = available_qt_binding()
+
+
+class TestWindowsAppIdentity(unittest.TestCase):
+    """Verify Windows receives the stable taskbar grouping identity."""
+
+    def test_sets_explicit_taskbar_identity_before_qt_window_creation(self):
+        """Passes the app ID through the Win32 shell API."""
+        shell32 = mock.Mock()
+        shell32.SetCurrentProcessExplicitAppUserModelID.return_value = 0
+        fake_windows = types.SimpleNamespace(shell32=shell32)
+        with mock.patch.object(sync_engine_startup.os, "name", "nt"), mock.patch.object(
+            sync_engine_startup.ctypes, "windll", fake_windows, create=True,
+        ):
+            self.assertTrue(set_windows_app_user_model_id())
+        shell32.SetCurrentProcessExplicitAppUserModelID.assert_called_once_with(
+            "SyncEngine.Desktop"
+        )
 
 
 @unittest.skipUnless(os.name == "nt" and QT_BINDING, "Windows and an existing PySide runtime are required.")

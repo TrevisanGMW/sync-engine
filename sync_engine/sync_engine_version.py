@@ -1,6 +1,5 @@
-"""SyncEngine application version.
-
-Update VERSION here when preparing a release.
+"""
+SyncEngine application version.
 """
 
-VERSION = "0.0.1"
+VERSION = "0.0.2"

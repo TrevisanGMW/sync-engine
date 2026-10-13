@@ -10,6 +10,23 @@ from pathlib import Path
 from sync_engine_model import default_data_directory
 
 
+def set_windows_app_user_model_id():
+    """Sets a stable Windows taskbar identity for the Qt application.
+
+    Returns:
+        bool: True when Windows accepted the application identity.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        result = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "SyncEngine.Desktop"
+        )
+    except (AttributeError, OSError):
+        return False
+    return result == 0
+
+
 def _startup_environment(executable):
     """Builds a runtime environment that isolates Maya's bundled libraries.
 

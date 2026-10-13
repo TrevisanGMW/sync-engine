@@ -17,13 +17,18 @@ def icon_path():
         resource_roots.append(os.path.join(extraction_root, "sync_engine", "resources"))
     resource_roots.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources"))
 
-    for resource_name in ("sync_engine.png", "sync_engine.svg"):
+    resource_names = (
+        ("sync_engine.ico", "sync_engine.png", "sync_engine.svg")
+        if os.name == "nt" else ("sync_engine.png", "sync_engine.svg")
+    )
+    for resource_name in resource_names:
         for resource_root in resource_roots:
             candidate = os.path.join(resource_root, resource_name)
             if os.path.isfile(candidate):
                 return candidate
 
-    return os.path.join(resource_roots[0], "sync_engine.png")
+    fallback_name = "sync_engine.ico" if os.name == "nt" else "sync_engine.png"
+    return os.path.join(resource_roots[0], fallback_name)
 
 
 def resource_path(resource_name):

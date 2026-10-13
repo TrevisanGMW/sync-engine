@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 try:
     from sync_engine_qt import QtCore, QtWidgets, qt_enum
+    from sync_engine_style import icon_path
     from sync_engine_view import SyncEngineView
 except ImportError:
     QtWidgets = None
@@ -122,6 +123,26 @@ class TestSyncEngineView(unittest.TestCase):
         """Keeps Preview and Sync aligned with the lower feedback bar."""
         self.assertIs(self.view.feedback_footer, self.view.preview_button.parentWidget())
         self.assertIs(self.view.feedback_footer, self.view.sync_button.parentWidget())
+
+    def test_window_uses_the_bundled_taskbar_icon(self):
+        """Loads the multi-resolution ICO on Windows for the native taskbar."""
+        selected_icon = icon_path()
+        self.assertTrue(os.path.isfile(selected_icon))
+        self.assertFalse(self.view.windowIcon().isNull())
+        if os.name == "nt":
+            self.assertEqual(".ico", os.path.splitext(selected_icon)[1].lower())
+
+    def test_footer_uses_one_background_and_no_spacer_before_actions(self):
+        """Shares one footer surface and gives status text the freed width."""
+        self.assertIn("#292d31", self.view.status_bar.styleSheet())
+        self.assertIn("#292d31", self.view.feedback_footer.styleSheet())
+        layout = self.view.feedback_footer.layout()
+        widgets = [layout.itemAt(index).widget() for index in range(layout.count())]
+        self.assertEqual(self.view.open_full_app_button, widgets[-4])
+        self.assertEqual(self.view.cancel_button, widgets[-3])
+        self.assertEqual(self.view.preview_button, widgets[-2])
+        self.assertEqual(self.view.sync_button, widgets[-1])
+        self.assertTrue(all(layout.itemAt(index).spacerItem() is None for index in range(layout.count())))
 
     def test_sync_button_has_balanced_window_edge_padding(self):
         """Balances the Sync button gap at the right and bottom window edges."""

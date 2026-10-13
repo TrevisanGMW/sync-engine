@@ -188,6 +188,7 @@ _PREVIEW_ROW_COLORS = {
     "skipped": ("#2d3033", "#aeb4b9"), "unchanged": ("#2b3033", "#bbc2c7"),
     "preserved": ("#30312c", "#d3d0ad"),
 }
+_FOOTER_BACKGROUND = "#292d31"
 
 
 class SyncEngineView(QtWidgets.QMainWindow):
@@ -372,12 +373,19 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.status_bar.setContentsMargins(12, 0, 12, 0)
         self.status_bar.setSizeGripEnabled(False)
         self.status_bar.setStyleSheet(
-            "QStatusBar#feedbackBar { background: #292d31; border-top: 1px solid #444a50; "
-            "padding: 0px; min-height: 52px; } "
+            f"QStatusBar#feedbackBar {{ background-color: {_FOOTER_BACKGROUND}; "
+            "border-top: 1px solid #444a50; padding: 0px; min-height: 52px; } "
             "QStatusBar::item { border: none; }"
         )
         self.setStatusBar(self.status_bar)
         self.feedback_footer = QtWidgets.QWidget()
+        self.feedback_footer.setObjectName("feedbackFooter")
+        self.feedback_footer.setAttribute(
+            qt_enum(QtCore.Qt, "WidgetAttribute", "WA_StyledBackground"), True
+        )
+        self.feedback_footer.setStyleSheet(
+            f"QWidget#feedbackFooter {{ background-color: {_FOOTER_BACKGROUND}; }}"
+        )
         footer_layout = QtWidgets.QHBoxLayout(self.feedback_footer)
         footer_layout.setContentsMargins(0, 0, 0, 0)
         footer_layout.setSpacing(8)
@@ -401,7 +409,6 @@ class SyncEngineView(QtWidgets.QMainWindow):
         )
         self.unsaved_label.hide()
         footer_layout.addWidget(self.unsaved_label)
-        footer_layout.addStretch(1)
         self.cancel_button = self._button("Cancel", self.cancel_requested.emit)
         self.cancel_button.setObjectName("cancelButton")
         self.cancel_button.setMinimumWidth(84)
