@@ -215,6 +215,8 @@ class SyncEngineView(QtWidgets.QMainWindow):
     automatic_runs_requested = QtCore.Signal()
     show_environment_variables_requested = QtCore.Signal()
     show_reports_requested = QtCore.Signal()
+    google_drive_setup_requested = QtCore.Signal()
+    google_drive_folder_requested = QtCore.Signal()
     plan_context_requested = QtCore.Signal(str, str)
     variable_test_requested = QtCore.Signal(str)
     path_feedback_requested = QtCore.Signal(str, str)
@@ -379,6 +381,9 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.folders_page = self._build_folders_page()
         self.exclusions_page = self.folders_page.exclusions_page
         self.folders_page.path_feedback_requested.connect(self.path_feedback_requested.emit)
+        self.folders_page.google_drive_browse_requested.connect(
+            self.google_drive_folder_requested.emit
+        )
         self.options_page = self._build_options_page()
         self.automation_page = self._build_automation_page()
         self.preview_page = self._build_preview_page()
@@ -614,10 +619,23 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.timestamp_tolerance.setSuffix(" seconds")
         self.timestamp_tolerance.setToolTip(multiline_tooltip(
             "Treat matching file sizes and modified times within this difference as unchanged. "
-            "Use a small tolerance for destinations with lower timestamp precision."
+            "Use a small tolerance for destinations with lower timestamp precision. Google Drive "
+            "stores modification times to 1 ms, so SyncEngine applies a 1 ms minimum there."
         ))
         form.addRow("Timestamp Tolerance", self.timestamp_tolerance)
         layout.addWidget(comparison)
+        google_drive = QtWidgets.QGroupBox("Google Drive")
+        google_drive_layout = QtWidgets.QHBoxLayout(google_drive)
+        self.google_drive_setup_status = QtWidgets.QLabel()
+        self.google_drive_setup_status.setWordWrap(True)
+        self.google_drive_setup_status.setObjectName("mutedLabel")
+        google_drive_layout.addWidget(self.google_drive_setup_status, 1)
+        self.google_drive_setup_button = self._button(
+            "Set Up Google Drive...",
+            lambda checked=False: self.google_drive_setup_requested.emit(),
+        )
+        google_drive_layout.addWidget(self.google_drive_setup_button)
+        layout.addWidget(google_drive)
         preview_details = QtWidgets.QGroupBox("Preview Details")
         preview_details_layout = QtWidgets.QVBoxLayout(preview_details)
         self.list_skipped_folder_contents = QtWidgets.QCheckBox(
@@ -1463,6 +1481,16 @@ class SyncEngineView(QtWidgets.QMainWindow):
             if str(summary.get("id", "")) == str(selected_id):
                 self.plans_list.setCurrentItem(item)
         self._loading = prior_loading
+
+    def set_google_drive_setup_status(self, message, button_text, enabled=True):
+        """Updates the compact rclone setup status in Options."""
+        self.google_drive_setup_status.setText(str(message))
+        self.google_drive_setup_button.setText(str(button_text))
+        self.google_drive_setup_button.setEnabled(bool(enabled))
+
+    def set_destination_path(self, path):
+        """Places a selected local or Google Drive destination into the editor."""
+        self.folders_page.destination_path.setText(str(path))
 
     def set_plan(self, plan):
         """Loads a plan into stable controls without emitting edit signals.

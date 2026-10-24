@@ -15,6 +15,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from sync_engine_rclone import is_rclone_path
+
 
 SCHEMA_VERSION = 1
 PLAN_EXTENSION = ".syncplan"
@@ -555,6 +557,9 @@ def _resolve_paths(plan, file_path):
             value = pair[field]
             if not value:
                 continue
+            if field == "destination" and is_rclone_path(value):
+                pair[field] = value.strip()
+                continue
             if _ENVIRONMENT_VARIABLE_PATTERN.search(value):
                 continue
             folder = Path(os.path.expandvars(os.path.expanduser(value)))
@@ -655,6 +660,9 @@ def resolve_plan_paths(plan, file_path=None):
             if not value:
                 continue
             expanded = os.path.expandvars(os.path.expanduser(expand_text(value)))
+            if field == "destination" and is_rclone_path(expanded):
+                pair[field] = expanded.strip()
+                continue
             folder = Path(expanded)
             if folder.drive and not folder.is_absolute():
                 raise ValueError(f"{field.title()} uses an ambiguous drive-relative path.")
@@ -691,16 +699,17 @@ def evaluate_plan_variable(plan, name, file_path=None):
     return resolved["pairs"][0]["source"]
 
 
-def resolve_path_template(plan, path_template, file_path=None):
+def resolve_path_template(plan, path_template, file_path=None, field=None):
     """Resolves one path template with the active plan's environment values.
 
     Args:
         plan (dict): Current plan, including unsaved variable definitions.
         path_template (str): Source or destination path template to inspect.
         file_path (str or pathlib.Path, optional): Current plan or action path.
+        field (str, optional): Path field being inspected, either ``source`` or ``destination``.
 
     Returns:
-        str: Expanded absolute path.
+        str: Expanded absolute local path or normalized Google Drive destination URI.
 
     Raises:
         ValueError: If the template is empty, contains an unknown variable, or
@@ -710,9 +719,12 @@ def resolve_path_template(plan, path_template, file_path=None):
         raise ValueError("Enter a path before checking its resolved result.")
     temporary = validate_plan(plan)
     temporary["pairs"] = [new_pair()]
-    temporary["pairs"][0]["source"] = path_template
+    field = field or ("destination" if is_rclone_path(path_template) else "source")
+    if field not in ("source", "destination"):
+        raise ValueError("The inspected path field must be source or destination.")
+    temporary["pairs"][0][field] = path_template
     resolved = resolve_plan_paths(temporary, file_path=file_path)
-    return resolved["pairs"][0]["source"]
+    return resolved["pairs"][0][field]
 
 
 def _read_json(path):

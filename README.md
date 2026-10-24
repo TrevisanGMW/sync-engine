@@ -52,6 +52,16 @@ The GUI launcher creates its private Qt runtime automatically when needed. The f
 6. Choose **Sync**. SyncEngine checks the plan again before it writes files and asks before planned removals.
 7. Save the plan to keep edits, or export a `.syncplan` file to share it.
 
+## Google Drive destinations
+
+SyncEngine can use rclone for Google Drive destinations without bundling rclone or adding a Python dependency. Open **Options > Google Drive** and choose **Set Up Google Drive**. SyncEngine downloads the current official rclone build only after that request, checks its SHA-256 against rclone's versioned checksum manifest, and stores the executable and rclone configuration under the app's `data/integrations/rclone/` folder.
+
+After the download, an rclone terminal opens. Create a new remote, give it a short name such as `gdrive`, choose the Google Drive backend (`drive`), and complete Google's browser authorization. Leave rclone's config password unset so scheduled and headless runs can use the saved OAuth token. Return to SyncEngine after setup; the Options status updates when the Drive remote is configured.
+
+In **Folders**, use the small arrow beside the destination browse button and choose **Browse Google Drive**. Pick an existing folder below the Drive root. Local destination browsing and all existing local plans continue to work the same way. Google Drive folder paths are saved in the plan, while the OAuth token stays in the local rclone config and is not included in exported plans.
+
+Drive destinations use the selected sync mode and the normal preview and confirmation flow. Mirror permanently removes reviewed Drive extras. Move verifies the uploaded copy and still asks before removing the local source. Two-way sync stores its baseline in SyncEngine's local sync history. Google Workspace documents such as Docs, Sheets, and Slides are shown as skipped and preserved because they are not ordinary files. Drive timestamps have 1 ms precision, so SyncEngine applies that minimum tolerance for Drive comparisons. Preview and transfer need a working network connection; if a Drive plan is used before rclone is configured, SyncEngine directs you to Options to finish setup.
+
 Move mode transfers included source files to the destination, replacing destination files when needed. Manual sync asks for approval before starting and asks again after destination files are verified, just before removing the originals. In **Options > Run Monitoring**, enable **Skip Prompt Before Removing Source After Copy Verification** to bypass the second prompt; it is off by default. Automatic actions still require explicit removal permission. Destination-only files and excluded source files are preserved; source folders remain in place.
 
 For Two-way mode, the first run merges files found on only one side. If both sides contain different versions of the same file, SyncEngine pauses and lists a conflict in Preview. Choose which side to keep, preview again, and sync. Later runs compare both sides with the last successfully saved baseline.

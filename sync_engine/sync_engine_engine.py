@@ -9,6 +9,7 @@ including removal in mirror mode.
 import copy
 import fnmatch
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -17,6 +18,7 @@ import tempfile
 import threading
 
 from sync_engine_model import normalize_exclusions, resolve_plan_paths
+import sync_engine_rclone as rclone
 
 
 CHUNK_SIZE = 1024 * 1024
@@ -94,6 +96,36 @@ def _report(callback, **values):
     """
     if callback is not None:
         callback(values)
+
+
+def _run_rclone(arguments, cancel_event=None, progress_callback=None, phase="scan",
+                message="Contacting Google Drive...", current_path=""):
+    """Runs rclone and translates integration errors into engine errors.
+
+    Args:
+        arguments (list[str]): Arguments passed to rclone.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Engine progress receiver.
+        phase (str): Operation phase shown in progress.
+        message (str): Status text while the command runs.
+        current_path (str): Path associated with the command.
+
+    Returns:
+        tuple[str, str]: Standard output and standard error.
+
+    Raises:
+        SyncError: If rclone returns a failure.
+        SyncCancelled: If cancellation is requested.
+    """
+    try:
+        return rclone.run_rclone_checked(
+            arguments, cancel_event=cancel_event, progress_callback=progress_callback,
+            phase=phase, message=message, current_path=current_path,
+        )
+    except rclone.RcloneCancelled as error:
+        raise SyncCancelled(str(error)) from error
+    except rclone.RcloneError as error:
+        raise SyncError(str(error)) from error
 
 
 def _canonical(path):
@@ -198,31 +230,52 @@ def _prepare_pairs(plan):
             normalized["exclusions"] = normalize_exclusions(pair)
         except ValueError as error:
             raise SyncError(str(error)) from error
+        normalized["destination_type"] = "local"
         for path_key in ("source", "destination"):
             raw_path = pair.get(path_key, "")
             if not isinstance(raw_path, str) or not raw_path.strip():
                 raise SyncError(f"Choose a {path_key} folder for '{pair.get('name', pair_id)}'.")
             raw_path = os.path.expanduser(raw_path)
+            if path_key == "destination" and rclone.is_rclone_path(raw_path):
+                try:
+                    remote_name, remote_folder = rclone.parse_rclone_path(raw_path)
+                    if not remote_folder:
+                        raise ValueError("Choose a folder below the Google Drive root.")
+                    rclone.ensure_drive_remote(raw_path)
+                except (ValueError, rclone.RcloneError) as error:
+                    raise SyncError(str(error)) from error
+                normalized[path_key] = raw_path.strip()
+                normalized["destination_type"] = "google_drive"
+                normalized[f"canonical_{path_key}"] = rclone.canonical_rclone_path(raw_path)
+                continue
+            if path_key == "source" and rclone.is_rclone_path(raw_path):
+                raise SyncError("Google Drive can be used as a destination; source folders must be local.")
             if not os.path.isabs(raw_path):
                 raise SyncError(f"The {path_key} path must be absolute: {raw_path}")
             normalized[path_key] = os.path.abspath(raw_path)
             normalized[f"canonical_{path_key}"] = _canonical(raw_path)
         destination = normalized["destination"]
-        if os.path.dirname(destination) == destination:
+        if normalized["destination_type"] == "local" and os.path.dirname(destination) == destination:
             raise SyncError("A filesystem root cannot be a backup destination.")
         _validate_components(normalized["source"])
-        _validate_components(destination)
         if not os.path.isdir(normalized["source"]):
             raise SyncError(f"The source folder does not exist: {normalized['source']}")
+        if normalized["destination_type"] == "local":
+            _validate_components(destination)
         pairs.append(normalized)
     for pair in pairs:
         for other_pair in pairs:
-            if _overlap(pair["canonical_destination"], other_pair["canonical_source"]):
+            if (pair["destination_type"] == "local"
+                    and _overlap(pair["canonical_destination"], other_pair["canonical_source"])):
                 raise SyncError("Source and destination folders must not overlap, including across pairs.")
-            if pair["id"] != other_pair["id"] and _overlap(
-                pair["canonical_destination"], other_pair["canonical_destination"]
-            ):
-                raise SyncError("Destination folders must not overlap across pairs.")
+            if pair["id"] == other_pair["id"]:
+                continue
+            if pair["destination_type"] == other_pair["destination_type"] == "google_drive":
+                if rclone.rclone_paths_overlap(pair["destination"], other_pair["destination"]):
+                    raise SyncError("Google Drive destination folders must not overlap across pairs.")
+            elif pair["destination_type"] == other_pair["destination_type"] == "local":
+                if _overlap(pair["canonical_destination"], other_pair["canonical_destination"]):
+                    raise SyncError("Destination folders must not overlap across pairs.")
     return pairs
 
 
@@ -436,6 +489,265 @@ def _iter_directory_entries(directory_path):
         raise SyncError(f"Cannot read folder '{directory_path}': {error}") from error
 
 
+def _scan_rclone(root, pair, cancel_event, progress_callback, protected_paths=None,
+                 scan_side=None, list_skipped_folder_contents=False):
+    """Scans a Google Drive folder through rclone's JSON listing command.
+
+    Args:
+        root (str): SyncEngine Google Drive destination URI.
+        pair (dict): Normalized pair options and exclusion rules.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Receives scan progress.
+        protected_paths (set[str] or None): Paths protected by the source scan.
+        scan_side (str or None): Pair side shown in progress.
+        list_skipped_folder_contents (bool): Whether to list skipped descendants.
+
+    Returns:
+        dict: Remote files, folders, protections and root identity.
+
+    Raises:
+        SyncError: If rclone data is invalid or the Drive folder is unavailable.
+        SyncCancelled: If cancellation is requested.
+    """
+    snapshot = {"files": {}, "directories": {}, "paths": {},
+                "protected": [], "protected_exact": [], "skipped": [],
+                "excluded": 0, "warnings": [],
+                "root_signature": None}
+    protected_paths = set(protected_paths or [])
+    _check_cancel(cancel_event)
+    try:
+        root_entry, unused_remote_path = _remote_entry(
+            root, cancel_event=cancel_event, progress_callback=progress_callback,
+        )
+        if root_entry is None or not root_entry.get("IsDir"):
+            raise SyncError(f"Google Drive destination folder is missing: {root}")
+        snapshot["root_signature"] = rclone.remote_root_signature(root, root_entry)
+        output, unused_error = _run_rclone(
+            ["lsjson", "--recursive", "--hash", rclone.rclone_remote_path(root)],
+            cancel_event=cancel_event, progress_callback=progress_callback,
+            phase="scan", message="Listing Google Drive folders...", current_path=root,
+        )
+        entries = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise SyncError("Rclone returned invalid Google Drive listing data.") from error
+    if not isinstance(entries, list):
+        raise SyncError("Rclone returned an unexpected Google Drive listing format.")
+
+    normalized_entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SyncError("Rclone returned an invalid Google Drive listing entry.")
+        actual_path = str(entry.get("Path") or entry.get("Name") or "").replace("\\", "/").strip("/")
+        if not actual_path or any(part in (".", "..") for part in actual_path.split("/")):
+            raise SyncError("Google Drive returned an unsafe relative path.")
+        normalized_entries.append((actual_path, entry))
+    normalized_entries.sort(key=lambda item: (item[0].count("/"), item[0].casefold()))
+
+    folder_include_rules = [
+        rule for rule in pair.get("exclusions", [])
+        if rule.get("effect") == "include" and rule.get("applies_to") in ("folders", "both")
+    ]
+    file_include_rules = [
+        rule for rule in pair.get("exclusions", [])
+        if rule.get("effect") == "include" and rule.get("applies_to") in ("files", "both")
+    ]
+    skipped_directories = {}
+    selected_folder_parents = {}
+    seen_paths = set()
+    scanned_files = 0
+    scanned_entries = 0
+
+    for actual_path, entry in normalized_entries:
+        _check_cancel(cancel_event)
+        relative_key = _relative_key(actual_path)
+        if relative_key in seen_paths:
+            raise SyncError(
+                f"Google Drive contains duplicate or case-colliding names: {actual_path}"
+            )
+        seen_paths.add(relative_key)
+        is_directory = bool(entry.get("IsDir"))
+        mime_type = str(entry.get("MimeType") or "")
+        entry_type = "folder" if is_directory else "file"
+        scanned_entries += 1
+        parent_key = relative_key.rpartition("/")[0]
+        parent_is_selected = selected_folder_parents.get(parent_key, False)
+        skipped_parent = None
+        parent = parent_key
+        while parent:
+            if parent in skipped_directories:
+                skipped_parent = skipped_directories[parent]
+                break
+            parent = parent.rpartition("/")[0]
+        progress_values = {
+            "phase": "scan", "pair_id": pair.get("id"), "scan_side": scan_side,
+            "relative_path": actual_path, "entry_type": entry_type,
+            "scanned_entries": scanned_entries, "scanned_files": scanned_files,
+            "current_path": rclone.join_rclone_path(root, actual_path),
+        }
+
+        if skipped_parent is not None:
+            snapshot["excluded"] += 1
+            if list_skipped_folder_contents:
+                reason = f"Inside skipped folder '{skipped_parent['relative_path']}'."
+                snapshot["skipped"].append({
+                    "relative_path": actual_path, "entry_type": entry_type,
+                    "rule": copy.deepcopy(skipped_parent.get("rule")), "reason": reason,
+                })
+                _report(
+                    progress_callback, **progress_values, kind="skipped", reason=reason,
+                    message=f"Listing skipped Google Drive folder contents: {actual_path}",
+                )
+            continue
+
+        snapshot["paths"][relative_key] = actual_path
+        if _protected(relative_key, protected_paths):
+            snapshot["protected"].append(relative_key)
+            snapshot["excluded"] += 1
+            if is_directory:
+                skipped_directories[relative_key] = {"relative_path": actual_path, "rule": None}
+            reason = "This item is outside the included source scope."
+            snapshot["skipped"].append({
+                "relative_path": actual_path, "entry_type": entry_type,
+                "rule": None, "reason": reason,
+            })
+            _report(
+                progress_callback, **progress_values, kind="skipped", reason=reason,
+                message=f"Skipping protected Google Drive {entry_type}: {actual_path}",
+            )
+            continue
+
+        if not is_directory and mime_type.startswith("application/vnd.google-apps."):
+            snapshot["protected"].append(relative_key)
+            snapshot["excluded"] += 1
+            reason = "Google Workspace documents are preserved because rclone exposes them as exports."
+            snapshot["skipped"].append({
+                "relative_path": actual_path, "entry_type": "file", "rule": None,
+                "reason": reason,
+            })
+            snapshot["warnings"].append(
+                f"Preserved Google Workspace document outside the file-sync scope: {actual_path}"
+            )
+            _report(
+                progress_callback, **progress_values, kind="skipped", reason=reason,
+                message=f"Preserving Google Workspace document: {actual_path}",
+            )
+            continue
+
+        try:
+            signature = rclone.remote_entry_signature(
+                entry, rclone.join_rclone_path(root, actual_path),
+            )
+        except ValueError as error:
+            raise SyncError(f"Cannot read Google Drive metadata for '{actual_path}': {error}") from error
+        rule = _matching_exclusion(
+            actual_path.rsplit("/", 1)[-1], actual_path, is_directory, pair,
+        )
+        if rule is not None and rule.get("effect") == "exclude":
+            snapshot["protected"].append(relative_key)
+            snapshot["excluded"] += 1
+            reason = _exclusion_reason(rule, entry_type)
+            snapshot["skipped"].append({
+                "relative_path": actual_path, "entry_type": entry_type,
+                "rule": copy.deepcopy(rule), "reason": reason,
+            })
+            if is_directory:
+                skipped_directories[relative_key] = {"relative_path": actual_path, "rule": rule}
+            _report(
+                progress_callback, **progress_values, kind="skipped", reason=reason,
+                message=f"Skipping excluded Google Drive {entry_type}: {actual_path}",
+            )
+            continue
+
+        if is_directory:
+            directory_candidates = snapshot.setdefault("directory_candidates", {})
+            directory_candidates[relative_key] = signature
+            included_folder = parent_is_selected or not folder_include_rules or rule is None
+            if included_folder and (folder_include_rules or not file_include_rules):
+                snapshot["directories"][relative_key] = signature
+            elif not included_folder:
+                snapshot["protected_exact"].append(relative_key)
+                snapshot["excluded"] += 1
+                snapshot["skipped"].append({
+                    "relative_path": actual_path, "entry_type": "folder",
+                    "rule": copy.deepcopy(rule),
+                })
+            selected_folder_parents[relative_key] = bool(folder_include_rules and included_folder)
+        else:
+            folder_gate_miss = bool(folder_include_rules and not parent_is_selected)
+            file_gate_miss = bool(rule is not None and rule.get("effect") == "include")
+            file_gate_pass = bool(file_include_rules and rule is None)
+            include_allowed = (
+                parent_is_selected or file_gate_pass or (not folder_gate_miss and not file_gate_miss)
+            )
+            if include_allowed:
+                snapshot["files"][relative_key] = signature
+                scanned_files += 1
+            else:
+                snapshot["protected_exact"].append(relative_key)
+                snapshot["excluded"] += 1
+                if folder_gate_miss and not file_include_rules:
+                    rule = {
+                        "effect": "include", "matched": False,
+                        "applies_to": "folders", "filter_scope": "folder_parent",
+                    }
+                snapshot["skipped"].append({
+                    "relative_path": actual_path, "entry_type": "file",
+                    "rule": copy.deepcopy(rule),
+                })
+
+        _report(
+            progress_callback, **progress_values, kind="scanning",
+            message=f"Scanning Google Drive {scan_side or 'folder'}...",
+        )
+
+    directory_candidates = snapshot.pop("directory_candidates", {})
+    selected_paths = set(snapshot["files"]) | set(snapshot["directories"])
+    promoted_directories = set()
+    for selected_path in selected_paths:
+        parent = selected_path.rpartition("/")[0]
+        while parent:
+            if parent in directory_candidates:
+                promoted_directories.add(parent)
+            parent = parent.rpartition("/")[0]
+    for relative_key in promoted_directories:
+        snapshot["directories"].setdefault(relative_key, directory_candidates[relative_key])
+    if promoted_directories:
+        snapshot["protected_exact"] = [
+            path for path in snapshot["protected_exact"] if path not in promoted_directories
+        ]
+        snapshot["skipped"] = [
+            row for row in snapshot["skipped"]
+            if not (row.get("entry_type") == "folder"
+                    and _relative_key(row.get("relative_path", "")) in promoted_directories)
+        ]
+    return snapshot
+
+
+def _remote_entry(path, cancel_event=None, progress_callback=None):
+    """Reads one remote entry while preserving engine cancellation semantics.
+
+    Args:
+        path (str): SyncEngine Google Drive file or folder URI.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Receives scan progress.
+
+    Returns:
+        tuple[dict or None, str]: Entry metadata and normalized path.
+
+    Raises:
+        SyncError: If rclone cannot inspect the remote entry.
+        SyncCancelled: If cancellation is requested.
+    """
+    try:
+        return rclone.remote_entry(
+            path, cancel_event=cancel_event, progress_callback=progress_callback,
+        )
+    except rclone.RcloneCancelled as error:
+        raise SyncCancelled(str(error)) from error
+    except rclone.RcloneError as error:
+        raise SyncError(str(error)) from error
+
+
 def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, scan_side=None,
           list_skipped_folder_contents=False):
     """Scans a directory without following links or hiding enumeration failures.
@@ -451,6 +763,12 @@ def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, sca
     Returns:
         dict: Files, directories, protected paths, warnings and root identity.
     """
+    if pair.get("destination_type") == "google_drive" and root == pair.get("destination"):
+        return _scan_rclone(
+            root, pair, cancel_event, progress_callback, protected_paths,
+            scan_side=scan_side,
+            list_skipped_folder_contents=list_skipped_folder_contents,
+        )
     snapshot = {"files": {}, "directories": {}, "paths": {},
                 "protected": [], "protected_exact": [], "skipped": [],
                 "excluded": 0, "warnings": []}
@@ -698,6 +1016,30 @@ def _hash_file(path, expected_signature, cancel_event, progress_callback):
     Returns:
         str: SHA-256 hexadecimal digest.
     """
+    if rclone.is_rclone_path(path):
+        entry, unused_remote_path = _remote_entry(path, cancel_event, progress_callback)
+        if entry is None:
+            raise SyncError(f"Google Drive file disappeared while preparing the preview: {path}")
+        try:
+            current_signature = rclone.remote_entry_signature(entry, path)
+        except ValueError as error:
+            raise SyncError(f"Cannot read Google Drive metadata for '{path}': {error}") from error
+        if current_signature != expected_signature:
+            raise SyncError(f"Google Drive file changed while preparing the preview: {path}")
+        try:
+            digest = rclone.hash_remote_file(
+                path, algorithm="sha256", cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+        except rclone.RcloneCancelled as error:
+            raise SyncCancelled(str(error)) from error
+        except rclone.RcloneError as error:
+            raise SyncError(str(error)) from error
+        entry_after, unused_remote_path = _remote_entry(path, cancel_event, progress_callback)
+        if entry_after is None or rclone.remote_entry_signature(entry_after, path) != expected_signature:
+            raise SyncError(f"Google Drive file changed while preparing the preview: {path}")
+        return digest
+
     digest = hashlib.sha256()
     if _file_signature(path) != expected_signature:
         raise SyncError(f"File changed while preparing the preview: {path}")
@@ -727,6 +1069,11 @@ def _join(root, relative_path):
     Returns:
         str: Absolute destination inside the supplied root.
     """
+    if rclone.is_rclone_path(root):
+        try:
+            return rclone.join_rclone_path(root, relative_path)
+        except ValueError as error:
+            raise SyncError(str(error)) from error
     if not isinstance(relative_path, str) or os.path.isabs(relative_path):
         raise SyncError("An operation contains an invalid relative path.")
     result = os.path.abspath(os.path.join(root, relative_path.replace("/", os.sep)))
@@ -793,6 +1140,8 @@ def _same_file(source_path, destination_path, source_signature, destination_sign
             destination_path, destination_signature, cancel_event, progress_callback
         )
     tolerance_ns = int(plan.get("timestamp_tolerance", 0.0) * 1_000_000_000)
+    if rclone.is_rclone_path(source_path) or rclone.is_rclone_path(destination_path):
+        tolerance_ns = max(tolerance_ns, 1_000_000)
     return abs(source_signature["mtime_ns"] - destination_signature["mtime_ns"]) <= tolerance_ns
 
 
@@ -1290,13 +1639,23 @@ def _assert_snapshot(expected, current, root):
         raise SyncError(f"Entry names changed since the preview. Compare again: {root}")
 
 
-def _check_target(path, expected_signature):
+def _check_target(path, expected_signature, cancel_event=None, progress_callback=None):
     """Checks a destination file immediately before replacing or removing it.
 
     Args:
         path (str): Destination filename.
         expected_signature (dict or None): Reviewed metadata, or expected absence.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Receives remote lookup progress.
     """
+    if rclone.is_rclone_path(path):
+        entry, unused_remote_path = _remote_entry(path, cancel_event, progress_callback)
+        if expected_signature is None:
+            if entry is not None:
+                raise SyncError(f"A new Google Drive entry appeared. Compare again: {path}")
+        elif entry is None or rclone.remote_entry_signature(entry, path) != expected_signature:
+            raise SyncError(f"Google Drive destination changed since the preview. Compare again: {path}")
+        return
     if expected_signature is None:
         if os.path.lexists(path):
             raise SyncError(f"A new destination entry appeared. Compare again: {path}")
@@ -1404,6 +1763,190 @@ def _open_source(path, expected_signature):
         raise
 
 
+def _copy_to_rclone(operation, result, progress, cancel_event, progress_callback,
+                    count_as_copy=True):
+    """Uploads one verified local file to a Google Drive destination.
+
+    Args:
+        operation (dict): Planned copy, update, or move.
+        result (dict): Aggregate sync result.
+        progress (dict): Shared progress counters.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Receives transfer progress.
+        count_as_copy (bool): Whether the transfer increments the copy count.
+
+    Returns:
+        dict: Verified signature of the uploaded remote file.
+
+    Raises:
+        SyncError: If the source or completed transfer fails verification.
+        SyncCancelled: If cancellation is requested.
+    """
+    source = operation["source"]
+    destination = operation["destination"]
+    _check_target(destination, operation["destination_signature"], cancel_event, progress_callback)
+    if _file_signature(source) != operation["source_signature"]:
+        raise SyncError(f"Source changed before copying: {source}")
+    _report(
+        progress_callback, **progress, phase="copy", current_path=destination,
+        current_file_bytes=0, current_file_total=operation["size"],
+        message=f"Uploading {operation['relative_path']} to Google Drive",
+    )
+    try:
+        rclone.copy_remote_file(
+            source, rclone.rclone_remote_path(destination),
+            cancel_event=cancel_event, progress_callback=progress_callback,
+        )
+    except rclone.RcloneCancelled as error:
+        raise SyncCancelled(str(error)) from error
+    except rclone.RcloneError as error:
+        raise SyncError(str(error)) from error
+    if _file_signature(source) != operation["source_signature"]:
+        raise SyncError(f"Source changed during upload; Google Drive copy may be incomplete: {source}")
+    entry, unused_remote_path = _remote_entry(destination, cancel_event, progress_callback)
+    if entry is None or entry.get("IsDir"):
+        raise SyncError(f"Rclone completed without creating the Google Drive file: {destination}")
+    try:
+        signature = rclone.remote_entry_signature(entry, destination)
+    except ValueError as error:
+        raise SyncError(f"Cannot verify Google Drive upload '{destination}': {error}") from error
+    if signature["size"] != operation["source_signature"]["size"]:
+        raise SyncError(f"Google Drive upload size did not match the source: {destination}")
+    try:
+        local_md5 = rclone.local_file_hash(
+            source, "md5", cancel_event=cancel_event, progress_callback=progress_callback,
+        )
+        remote_md5 = signature.get("hash_md5")
+        if remote_md5 is None:
+            remote_md5 = rclone.hash_remote_file(
+                destination, "md5", cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+        if local_md5 != remote_md5:
+            raise SyncError(f"Google Drive upload content did not match the source: {destination}")
+    except rclone.RcloneCancelled as error:
+        raise SyncCancelled(str(error)) from error
+    except rclone.RcloneError as error:
+        raise SyncError(str(error)) from error
+    entry_after, unused_remote_path = _remote_entry(destination, cancel_event, progress_callback)
+    if (entry_after is None
+            or rclone.remote_entry_signature(entry_after, destination) != signature
+            or _file_signature(source) != operation["source_signature"]):
+        raise SyncError(f"Google Drive file changed during upload verification: {destination}")
+    if count_as_copy:
+        result["copied"] += 1
+    result["bytes"] += operation["size"]
+    progress["completed_bytes"] += operation["size"]
+    _report(
+        progress_callback, **progress, phase="copy", current_path=destination,
+        current_file_bytes=operation["size"], current_file_total=operation["size"],
+        message=f"Completed upload: {operation['relative_path']}",
+    )
+    return signature
+
+
+def _copy_from_rclone(operation, result, progress, cancel_event, progress_callback,
+                      count_as_copy=True):
+    """Downloads one Google Drive file to a local target using an atomic replace.
+
+    Args:
+        operation (dict): Planned copy or update.
+        result (dict): Aggregate sync result.
+        progress (dict): Shared progress counters.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Receives transfer progress.
+        count_as_copy (bool): Whether the transfer increments the copy count.
+
+    Returns:
+        dict: Verified signature of the local file.
+
+    Raises:
+        SyncError: If the source or completed transfer fails verification.
+        SyncCancelled: If cancellation is requested.
+    """
+    source = operation["source"]
+    destination = operation["destination"]
+    parent = os.path.dirname(destination)
+    _validate_components(parent)
+    _check_target(destination, operation["destination_signature"])
+    _check_target(source, operation["source_signature"], cancel_event, progress_callback)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".sync_engine-", suffix=".tmp", dir=parent,
+    )
+    os.close(descriptor)
+    os.unlink(temporary_path)
+    try:
+        _report(
+            progress_callback, **progress, phase="copy", current_path=source,
+            current_file_bytes=0, current_file_total=operation["size"],
+            message=f"Downloading {operation['relative_path']} from Google Drive",
+        )
+        try:
+            rclone.copy_remote_file(
+                rclone.rclone_remote_path(source), temporary_path,
+                cancel_event=cancel_event, progress_callback=progress_callback,
+            )
+        except rclone.RcloneCancelled as error:
+            raise SyncCancelled(str(error)) from error
+        except rclone.RcloneError as error:
+            raise SyncError(str(error)) from error
+        if not os.path.isfile(temporary_path) or os.path.islink(temporary_path):
+            raise SyncError(f"Rclone did not create a local copy of '{source}'.")
+        temporary_signature = _file_signature(temporary_path)
+        if temporary_signature["size"] != operation["source_signature"]["size"]:
+            raise SyncError(f"Downloaded file size did not match Google Drive: {source}")
+        remote_md5 = operation["source_signature"].get("hash_md5")
+        try:
+            local_md5 = rclone.local_file_hash(
+                temporary_path, "md5", cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+            if remote_md5 is None:
+                remote_md5 = rclone.hash_remote_file(
+                    source, "md5", cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                )
+        except rclone.RcloneCancelled as error:
+            raise SyncCancelled(str(error)) from error
+        except rclone.RcloneError as error:
+            raise SyncError(str(error)) from error
+        if local_md5 != remote_md5:
+            raise SyncError(f"Downloaded file content did not match Google Drive: {source}")
+        remote_entry_after, unused_remote_path = _remote_entry(
+            source, cancel_event, progress_callback,
+        )
+        if (remote_entry_after is None
+                or rclone.remote_entry_signature(remote_entry_after, source)
+                != operation["source_signature"]):
+            raise SyncError(f"Google Drive source changed during download: {source}")
+        if operation["source_signature"].get("mtime_ns"):
+            modified_ns = operation["source_signature"]["mtime_ns"]
+            os.utime(temporary_path, ns=(modified_ns, modified_ns))
+        _check_cancel(cancel_event)
+        _validate_components(parent)
+        _check_target(destination, operation["destination_signature"])
+        _check_target(source, operation["source_signature"], cancel_event, progress_callback)
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        signature = _file_signature(destination)
+        if count_as_copy:
+            result["copied"] += 1
+        result["bytes"] += operation["size"]
+        progress["completed_bytes"] += operation["size"]
+        _report(
+            progress_callback, **progress, phase="copy", current_path=destination,
+            current_file_bytes=operation["size"], current_file_total=operation["size"],
+            message=f"Completed download: {operation['relative_path']}",
+        )
+        return signature
+    finally:
+        if temporary_path and os.path.lexists(temporary_path):
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                LOGGER.warning("Could not remove incomplete download: %s", temporary_path, exc_info=True)
+
+
 def _copy_atomic(operation, result, progress, cancel_event, progress_callback, count_as_copy=True):
     """Copies to a temporary sibling and replaces the target only after verification.
 
@@ -1420,6 +1963,16 @@ def _copy_atomic(operation, result, progress, cancel_event, progress_callback, c
     """
     source = operation["source"]
     destination = operation["destination"]
+    if rclone.is_rclone_path(destination):
+        return _copy_to_rclone(
+            operation, result, progress, cancel_event, progress_callback,
+            count_as_copy=count_as_copy,
+        )
+    if rclone.is_rclone_path(source):
+        return _copy_from_rclone(
+            operation, result, progress, cancel_event, progress_callback,
+            count_as_copy=count_as_copy,
+        )
     parent = os.path.dirname(destination)
     _validate_components(parent)
     _check_target(destination, operation["destination_signature"])
@@ -1471,14 +2024,38 @@ def _copy_atomic(operation, result, progress, cancel_event, progress_callback, c
                 LOGGER.warning("Could not remove incomplete copy: %s", temporary_path, exc_info=True)
 
 
-def _make_directory(operation, pair_snapshot):
+def _make_directory(operation, pair_snapshot, cancel_event=None, progress_callback=None):
     """Creates a previewed missing directory and records its new identity.
 
     Args:
         operation (dict): Planned mkdir operation.
         pair_snapshot (dict): Expected destination snapshot updated after creation.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Receives operation progress.
     """
     destination = operation["destination"]
+    if rclone.is_rclone_path(destination):
+        _check_target(destination, None, cancel_event, progress_callback)
+        try:
+            rclone.make_remote_directory(
+                destination, cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+        except rclone.RcloneCancelled as error:
+            raise SyncCancelled(str(error)) from error
+        except rclone.RcloneError as error:
+            raise SyncError(str(error)) from error
+        entry, unused_remote_path = _remote_entry(destination, cancel_event, progress_callback)
+        if entry is None or not entry.get("IsDir"):
+            raise SyncError(f"Google Drive did not create the expected folder: {destination}")
+        signature = rclone.remote_entry_signature(entry, destination)
+        if operation["relative_path"]:
+            relative_key = _relative_key(operation["relative_path"])
+            pair_snapshot["directories"][relative_key] = signature
+            pair_snapshot["paths"][relative_key] = operation["relative_path"]
+        else:
+            pair_snapshot["root_signature"] = signature
+        return
     _validate_components(destination)
     if os.path.lexists(destination):
         raise SyncError(f"A destination directory appeared since the preview: {destination}")
@@ -1492,15 +2069,29 @@ def _make_directory(operation, pair_snapshot):
         pair_snapshot["root_signature"] = signature
 
 
-def _guard_roots(pair, pair_snapshot):
+def _guard_roots(pair, pair_snapshot, cancel_event=None, progress_callback=None):
     """Rejects replaced or redirected roots immediately before an operation.
 
     Args:
         pair (dict): Normalized pair paths.
         pair_snapshot (dict): Expected source and destination identities.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Receives remote lookup progress.
     """
     for root_name in ("source", "destination"):
         root_path = pair[root_name]
+        if root_name == "destination" and pair.get("destination_type") == "google_drive":
+            expected_signature = pair_snapshot[root_name]["root_signature"]
+            entry, unused_remote_path = _remote_entry(
+                root_path, cancel_event, progress_callback,
+            )
+            if entry is None or not entry.get("IsDir"):
+                raise SyncError(f"Google Drive folder disappeared during synchronization: {root_path}")
+            current_signature = rclone.remote_root_signature(root_path, entry)
+            if (expected_signature is None
+                    or _identity(expected_signature) != _identity(current_signature)):
+                raise SyncError(f"Google Drive folder was replaced during synchronization: {root_path}")
+            continue
         _validate_components(root_path)
         expected_signature = pair_snapshot[root_name]["root_signature"]
         if expected_signature is not None:
@@ -1529,11 +2120,41 @@ def _move_source_file(operation, pair, pair_snapshot, destination_signature, pla
     """
     source_path = operation["source"]
     destination_path = operation["destination"]
-    _guard_roots(pair, pair_snapshot)
+    _guard_roots(pair, pair_snapshot, cancel_event, progress_callback)
     _validate_components(os.path.dirname(source_path))
-    _validate_components(os.path.dirname(destination_path))
     if _file_signature(source_path) != operation["source_signature"]:
         raise SyncError(f"Source changed before it could be moved; source preserved: {source_path}")
+    if rclone.is_rclone_path(destination_path):
+        _check_target(destination_path, destination_signature, cancel_event, progress_callback)
+        try:
+            local_md5 = rclone.local_file_hash(
+                source_path, "md5", cancel_event, progress_callback,
+            )
+            destination_md5 = destination_signature.get("hash_md5")
+            if destination_md5 is None:
+                destination_md5 = rclone.hash_remote_file(
+                    destination_path, "md5", cancel_event, progress_callback,
+                )
+        except rclone.RcloneCancelled as error:
+            raise SyncCancelled(str(error)) from error
+        except rclone.RcloneError as error:
+            raise SyncError(str(error)) from error
+        if (destination_signature.get("size") != operation["source_signature"].get("size")
+                or destination_md5 != local_md5):
+            raise SyncError(
+                f"Destination does not contain the source file; source preserved: {source_path}"
+            )
+        _check_cancel(cancel_event)
+        _check_target(destination_path, destination_signature, cancel_event, progress_callback)
+        if (_file_signature(source_path) != operation["source_signature"]):
+            raise SyncError(f"A file changed before move completion; source preserved: {source_path}")
+        os.unlink(source_path)
+        source_snapshot = pair_snapshot["source"]
+        source_key = _relative_key(operation.get("source_relative_path", operation["relative_path"]))
+        source_snapshot["files"].pop(source_key, None)
+        source_snapshot["paths"].pop(source_key, None)
+        return
+    _validate_components(os.path.dirname(destination_path))
     if _file_signature(destination_path) != destination_signature:
         raise SyncError(f"Destination changed before source removal; source preserved: {destination_path}")
     if not _same_file(
@@ -1552,26 +2173,75 @@ def _move_source_file(operation, pair, pair_snapshot, destination_signature, pla
     source_snapshot["paths"].pop(source_key, None)
 
 
-def _remove_entry(operation, pair, pair_snapshot):
+def _remove_entry(operation, pair, pair_snapshot, cancel_event=None, progress_callback=None):
     """Removes a still-unchanged file or a verified empty extra directory.
 
     Args:
         operation (dict): Reviewed delete or rmdir operation.
         pair (dict): Normalized pair paths.
         pair_snapshot (dict): Expected state updated after removal.
+        cancel_event (threading.Event or None): Cancellation flag.
+        progress_callback (callable or None): Receives operation progress.
     """
     destination = operation["destination"]
     target_root = operation.get("target_root", "destination")
     source_root = operation.get("source_root", "source")
     destination_snapshot = pair_snapshot[target_root]
-    _guard_roots(pair, pair_snapshot)
+    _guard_roots(pair, pair_snapshot, cancel_event, progress_callback)
     counterpart_root = "destination" if target_root == "source" else "source"
     source_counterpart = _join(pair[counterpart_root], operation["relative_path"])
-    if os.path.lexists(source_counterpart):
+    if rclone.is_rclone_path(source_counterpart):
+        counterpart_entry, unused_remote_path = _remote_entry(
+            source_counterpart, cancel_event, progress_callback,
+        )
+        counterpart_exists = counterpart_entry is not None
+    else:
+        counterpart_exists = os.path.lexists(source_counterpart)
+    if counterpart_exists:
         raise SyncError(f"A source entry appeared during synchronization; destination preserved: {source_counterpart}")
+    if rclone.is_rclone_path(destination):
+        _check_target(
+            destination, operation["destination_signature"], cancel_event, progress_callback,
+        )
+        if operation["kind"] == "delete":
+            try:
+                rclone.remove_remote_file(
+                    destination, cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                )
+            except rclone.RcloneCancelled as error:
+                raise SyncCancelled(str(error)) from error
+            except rclone.RcloneError as error:
+                raise SyncError(str(error)) from error
+            destination_snapshot["files"].pop(_relative_key(operation["relative_path"]), None)
+        else:
+            try:
+                listing, unused_error = _run_rclone(
+                    ["lsjson", rclone.rclone_remote_path(destination)],
+                    cancel_event=cancel_event, progress_callback=progress_callback,
+                    phase="delete", message="Checking Google Drive folder contents...",
+                    current_path=destination,
+                )
+                entries = json.loads(listing)
+            except json.JSONDecodeError as error:
+                raise SyncError("Rclone returned invalid Google Drive folder contents.") from error
+            if entries:
+                raise SyncError(f"Extra Google Drive folder contains new entries; preserved: {destination}")
+            try:
+                rclone.remove_remote_directory(
+                    destination, cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                )
+            except rclone.RcloneCancelled as error:
+                raise SyncCancelled(str(error)) from error
+            except rclone.RcloneError as error:
+                raise SyncError(str(error)) from error
+            destination_snapshot["directories"].pop(_relative_key(operation["relative_path"]), None)
+        destination_snapshot["paths"].pop(_relative_key(operation["relative_path"]), None)
+        return
     _validate_components(os.path.dirname(destination))
     if operation["kind"] == "delete":
-        _check_target(destination, operation["destination_signature"])
+        _check_target(destination, operation["destination_signature"], cancel_event, progress_callback)
         os.unlink(destination)
         destination_snapshot["files"].pop(_relative_key(operation["relative_path"]))
     else:
@@ -1635,11 +2305,16 @@ def execute_preview(preview, cancel_event=None, progress_callback=None, allow_de
         move_destination_signatures = {}
         for operation in additions:
             _check_cancel(cancel_event)
-            _guard_roots(pair_lookup[operation["pair_id"]], snapshots[operation["pair_id"]])
+            _guard_roots(
+                pair_lookup[operation["pair_id"]], snapshots[operation["pair_id"]],
+                cancel_event, progress_callback,
+            )
             target_root = operation.get("target_root", "destination")
             destination_snapshot = snapshots[operation["pair_id"]][target_root]
             if operation["kind"] == "mkdir":
-                _make_directory(operation, destination_snapshot)
+                _make_directory(
+                    operation, destination_snapshot, cancel_event, progress_callback,
+                )
             elif operation["kind"] == "move":
                 if operation.get("copy_action"):
                     signature = _copy_atomic(
@@ -1674,6 +2349,8 @@ def execute_preview(preview, cancel_event=None, progress_callback=None, allow_de
                     progress_callback, **progress, phase="copy", current_path=operation["source"],
                     message=f"Prepared move: {operation['relative_path']}",
                 )
+        for pair in pairs:
+            _guard_roots(pair, snapshots[pair["id"]], cancel_event, progress_callback)
         if deletions or moves:
             _revalidate_pairs(pairs, snapshots, cancel_event, progress_callback)
         remove_sources = True
@@ -1686,7 +2363,10 @@ def execute_preview(preview, cancel_event=None, progress_callback=None, allow_de
                 )
         for operation in deletions:
             _check_cancel(cancel_event)
-            _remove_entry(operation, pair_lookup[operation["pair_id"]], snapshots[operation["pair_id"]])
+            _remove_entry(
+                operation, pair_lookup[operation["pair_id"]], snapshots[operation["pair_id"]],
+                cancel_event, progress_callback,
+            )
             if operation["kind"] == "delete":
                 result["deleted"] += 1
             progress["completed_operations"] += 1

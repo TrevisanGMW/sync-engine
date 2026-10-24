@@ -27,6 +27,7 @@ class FolderPairEditor(QtWidgets.QWidget):
 
     changed = QtCore.Signal()
     path_feedback_requested = QtCore.Signal(str, str)
+    google_drive_browse_requested = QtCore.Signal()
 
     def __init__(self, parent=None):
         """Creates a reusable editor without an external model dependency.
@@ -167,7 +168,9 @@ class FolderPairEditor(QtWidgets.QWidget):
             "Supports {variable} path tokens defined in the Variables tab, plus built-in path variables."
         )
         self.source_path.setToolTip(variable_tip)
-        self.destination_path.setToolTip(variable_tip)
+        self.destination_path.setToolTip(
+            f"{variable_tip} Use the folder button menu to choose a local folder or Google Drive."
+        )
         paths.addRow("Source", self._path_row(self.source_path, self._browse_source, "Source"))
         paths.addRow(
             "Destination",
@@ -434,16 +437,35 @@ class FolderPairEditor(QtWidgets.QWidget):
         feedback_button.setToolTip("Show the resolved path and whether it currently exists")
         feedback_button.setAccessibleName(f"Inspect {label.lower()} path")
         layout.addWidget(feedback_button)
-        button = self._button("", callback)
+        if label.casefold() == "destination":
+            button = QtWidgets.QToolButton()
+            button.setAutoRaise(False)
+            button.setPopupMode(qt_enum(
+                QtWidgets.QToolButton, "ToolButtonPopupMode", "MenuButtonPopup",
+            ))
+            menu = QtWidgets.QMenu(button)
+            local_action = menu.addAction("Browse local folder...")
+            local_action.triggered.connect(lambda checked=False: callback())
+            drive_action = menu.addAction("Browse Google Drive...")
+            drive_action.triggered.connect(
+                lambda checked=False: self.google_drive_browse_requested.emit()
+            )
+            button.setMenu(menu)
+            button.clicked.connect(lambda checked=False: callback())
+        else:
+            button = self._button("", callback)
         button.setIcon(padded_icon("icons/folder_open.svg"))
         if button.icon().isNull():
             button.setIcon(QtWidgets.QApplication.style().standardIcon(
                 qt_enum(QtWidgets.QStyle, "StandardPixmap", "SP_DirOpenIcon")
             ))
         button.setIconSize(QtCore.QSize(24, 24))
-        button.setStyleSheet("QPushButton { padding: 0px; }")
+        button.setStyleSheet("QPushButton, QToolButton { padding: 0px; }")
         button.setFixedSize(33, 33)
-        button.setToolTip("Browse for a folder")
+        button.setToolTip(
+            "Browse for a local folder" if label.casefold() == "source"
+            else "Browse for a local folder or a Google Drive folder"
+        )
         layout.addWidget(button)
         return row
 
