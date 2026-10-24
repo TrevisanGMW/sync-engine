@@ -49,12 +49,12 @@ def describe_preview(preview):
     summary = preview["summary"]
     return (
         f"{summary.get('copy', 0)} new, {summary.get('update', 0)} changed, "
-        f"{summary.get('delete', 0)} files to remove, "
+        f"{summary.get('move', 0)} files to move, {summary.get('delete', 0)} files to remove, "
         f"{summary.get('conflict', 0)} conflicts, "
         f"{summary.get('rmdir', 0)} folders to remove; "
         f"{summary.get('unchanged', 0)} unchanged; "
         f"{summary.get('skipped', 0)} skipped; "
-        f"{format_size(summary.get('bytes', 0))} to copy"
+        f"{format_size(summary.get('bytes', 0))} to transfer"
     )
 
 
@@ -97,6 +97,8 @@ def run_headless(options):
             completed = format_size(data.get("completed_bytes", 0))
             total = format_size(data.get("total_bytes", 0))
             print(f"Copying {completed} / {total}: {data.get('current_path', '')}", flush=True)
+        elif phase == "delete" and data.get("message"):
+            print(data["message"], flush=True)
         elif phase in ("scan", "compare"):
             print(f"{phase.capitalize()}: {data.get('scanned_files', 0)} files", flush=True)
 
@@ -192,7 +194,7 @@ def run_headless(options):
         else:
             print(
                 f"{result['status'].capitalize()}: {result.get('copied', 0)} copied, "
-                f"{result.get('deleted', 0)} removed. Log: {log_path}", flush=True,
+                f"{result.get('moved', 0)} moved, {result.get('deleted', 0)} removed. Log: {log_path}", flush=True,
             )
             for message in result.get("errors", []) + result.get("warnings", []):
                 print(message, flush=True)
@@ -201,7 +203,7 @@ def run_headless(options):
         cancel_event.set()
         if timed_out[0]:
             result = {
-                "status": "timed_out", "copied": 0, "deleted": 0, "bytes": 0,
+                "status": "timed_out", "copied": 0, "moved": 0, "deleted": 0, "bytes": 0,
                 "errors": [], "warnings": ["The configured timeout elapsed before the run completed."],
                 "log_path": log_path,
             }

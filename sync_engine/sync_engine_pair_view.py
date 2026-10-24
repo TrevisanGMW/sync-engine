@@ -147,8 +147,7 @@ class FolderPairEditor(QtWidgets.QWidget):
         list_layout.addWidget(self.pairs_list, 1)
         controls = QtWidgets.QHBoxLayout()
         self.add_pair_button = self._button("Add Folder Pair", self._add_pair)
-        controls.addWidget(self.add_pair_button)
-        controls.addStretch()
+        controls.addWidget(self.add_pair_button, 1)
         list_layout.addLayout(controls)
         content.addWidget(list_container)
         self.pair_editor = QtWidgets.QWidget()
@@ -186,6 +185,7 @@ class FolderPairEditor(QtWidgets.QWidget):
         self.mode_combo.addItem("Add Only - Copy Missing Files", "add")
         self.mode_combo.addItem("Update - Add and Replace Changed Files", "update")
         self.mode_combo.addItem("Mirror - Also Remove Destination Extras", "mirror")
+        self.mode_combo.addItem("Move - Transfer Files and Remove from Source", "move")
         self.mode_combo.addItem("Two-Way - Merge Changes From Both Folders", "two_way")
         paths.addRow("Sync Mode", self.mode_combo)
         editor_layout.addLayout(paths)
@@ -749,6 +749,10 @@ class FolderPairEditor(QtWidgets.QWidget):
             "mirror": (
                 "Copies missing and changed files, then removes destination extras. Excluded items are preserved."
             ),
+            "move": (
+                "Transfers included source files to the destination and removes each source file after "
+                "verification. Destination-only files and excluded items are preserved."
+            ),
             "two_way": (
                 "Merges changes on either side using saved sync history. First sync combines non-conflicting files; "
                 "different edits to the same file require a choice. Deletions propagate after confirmation."
@@ -756,7 +760,7 @@ class FolderPairEditor(QtWidgets.QWidget):
         }
         mode = self.mode_combo.currentData()
         self.mode_description.setText(descriptions.get(mode, ""))
-        color = "#d0b58a" if mode in ("mirror", "two_way") else "#b6b6b6"
+        color = "#d0b58a" if mode in ("mirror", "move", "two_way") else "#b6b6b6"
         self.mode_description.setStyleSheet(f"color: {color};")
 
 

@@ -104,17 +104,39 @@ QLabel#sectionTitle { font-size: 14px; font-weight: 600; }
 QLabel#mutedLabel { color: #b6b6b6; }
 QLabel#progressTitle { font-size: 15px; font-weight: 600; }
 QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox,
-QTableWidget, QListWidget {
+QTableWidget, QTreeWidget, QListWidget {
     background: #252525; color: #eeeeee; border: 1px solid #555555;
     border-radius: 4px; selection-background-color: #527f9a;
     selection-color: #ffffff;
 }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding: 5px; min-height: 21px; }
+QSpinBox#targetPathDepthSpinBox { padding: 3px 5px; min-height: 25px; }
+QSpinBox#targetPathDepthSpinBox::up-button,
+QSpinBox#targetPathDepthSpinBox::down-button {
+    subcontrol-origin: border; subcontrol-position: top right; width: 23px;
+    background: #405c6c; border-left: 1px solid #7894a4;
+}
+QSpinBox#targetPathDepthSpinBox::down-button {
+    subcontrol-position: bottom right; border-top: 1px solid #7894a4;
+}
+QSpinBox#targetPathDepthSpinBox::up-button:hover,
+QSpinBox#targetPathDepthSpinBox::down-button:hover { background: #527f9a; }
+QSpinBox#targetPathDepthSpinBox::up-arrow {
+    width: 0px; height: 0px;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-bottom: 5px solid #f4f7f8;
+}
+QSpinBox#targetPathDepthSpinBox::down-arrow {
+    width: 0px; height: 0px;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-top: 5px solid #f4f7f8;
+}
 QPlainTextEdit { padding: 5px; }
 QListWidget { padding: 4px; outline: none; }
 QListWidget::item { padding: 9px 7px; border-radius: 3px; }
 QListWidget::item:selected { background: #3c6177; color: #ffffff; }
 QListWidget::item:hover:!selected { background: #404040; }
+QTreeWidget::item:selected { background: #527f9a; color: #ffffff; }
 QPushButton, QToolButton {
     background: #484848; color: #eeeeee; border: 1px solid #626262;
     border-radius: 4px; padding: 7px 11px;

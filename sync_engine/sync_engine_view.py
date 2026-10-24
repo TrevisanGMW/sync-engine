@@ -2,6 +2,7 @@
 
 import copy
 import ntpath
+import os
 import re
 
 from sync_engine_qt import QtCore, QtGui, QtWidgets, qt_enum
@@ -139,12 +140,14 @@ class _PreviewProgressDelegate(QtWidgets.QStyledItemDelegate):
 
 _PREVIEW_LABELS = {
     "copy": "New File", "update": "Replace File", "delete": "Remove File",
+    "move": "Move File",
     "mkdir": "New Folder", "rmdir": "Remove Folder", "conflict": "Resolve Conflict",
     "skipped": "Skipped (Filtered)", "unchanged": "Unchanged", "preserved": "Preserved",
 }
 _PREVIEW_REASONS = {
     "copy": "No matching file exists on the target side.",
     "update": "The source and target differ under the selected comparison.",
+    "move": "Transfer the source file, then remove it from the source after verification.",
     "delete": "This extra file will be removed in Mirror mode.",
     "mkdir": "This folder does not exist on the target side.",
     "rmdir": "This extra folder will be removed in Mirror mode.",
@@ -153,7 +156,7 @@ _PREVIEW_REASONS = {
     "preserved": "This item is preserved by the selected sync mode.",
 }
 _EXECUTED_PREVIEW_LABELS = {
-    "copy": "Copied", "update": "Updated", "delete": "Removed",
+    "copy": "Copied", "update": "Updated", "delete": "Removed", "move": "Moved",
     "mkdir": "Created Folder", "rmdir": "Removed Folder",
 }
 _ENVIRONMENT_VARIABLE_DESCRIPTIONS = {
@@ -183,6 +186,7 @@ _ENVIRONMENT_VARIABLE_DESCRIPTIONS = {
 }
 _PREVIEW_ROW_COLORS = {
     "copy": ("#26372c", "#c3dbc8"), "mkdir": ("#26372c", "#c3dbc8"),
+    "move": ("#3a3026", "#e1c79d"),
     "update": ("#283541", "#c4d8e8"), "delete": ("#3a3026", "#e1c79d"),
     "rmdir": ("#3a3026", "#e1c79d"), "conflict": ("#402b2b", "#edb1a6"),
     "skipped": ("#2d3033", "#aeb4b9"), "unchanged": ("#2b3033", "#bbc2c7"),
@@ -204,6 +208,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
     preview_requested = QtCore.Signal()
     sync_requested = QtCore.Signal()
     cancel_requested = QtCore.Signal()
+    pause_requested = QtCore.Signal()
     register_actions_requested = QtCore.Signal()
     show_logs_requested = QtCore.Signal()
     preferences_requested = QtCore.Signal()
@@ -216,6 +221,8 @@ class SyncEngineView(QtWidgets.QMainWindow):
     conflict_resolution_requested = QtCore.Signal(str, str)
     plan_selected = QtCore.Signal(str)
     plan_edited = QtCore.Signal()
+    preview_view_changed = QtCore.Signal(str)
+    preview_render_finished = QtCore.Signal()
     closing = QtCore.Signal(object)
 
     def __init__(self, parent=None):
@@ -228,6 +235,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self._plan = None
         self._loading = False
         self._busy = False
+        self._syncing = False
         self._automatic_run_mode = False
         self._dirty = False
         self._countdown_total = None
@@ -241,6 +249,28 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self._preview_generation_active = False
         self._preview_scan_rows = {}
         self._preview_scan_row_limit = 500
+        self._preview_scan_tree_items = {}
+        self._preview_scan_tree_roots = {}
+        self._preview_tree_items = {}
+        self._preview_tree_roots = {}
+        self._preview_tree_paths = {}
+        self._preview_render_batch_size = 40
+        self._preview_render_state = None
+        self._preview_tree_progress_snapshot = {}
+        self._pending_preview_completions = []
+        self._preview_completion_batch_size = 100
+        self._preview_render_timer = QtCore.QTimer(self)
+        self._preview_render_timer.setInterval(1)
+        self._preview_render_timer.timeout.connect(self._render_preview_batch)
+        self._preview_completion_timer = QtCore.QTimer(self)
+        self._preview_completion_timer.setInterval(1)
+        self._preview_completion_timer.timeout.connect(self._process_preview_completion_batch)
+        self._recursive_tree_items = []
+        self._recursive_tree_index = 0
+        self._recursive_tree_expanded = True
+        self._recursive_tree_timer = QtCore.QTimer(self)
+        self._recursive_tree_timer.setInterval(1)
+        self._recursive_tree_timer.timeout.connect(self._process_recursive_tree_expansion)
         self._automatic_confirmation_dialog = None
         self.preview_show_full_target_path = False
         self.preview_target_path_depth = 2
@@ -411,8 +441,13 @@ class SyncEngineView(QtWidgets.QMainWindow):
         footer_layout.addWidget(self.unsaved_label)
         self.cancel_button = self._button("Cancel", self.cancel_requested.emit)
         self.cancel_button.setObjectName("cancelButton")
-        self.cancel_button.setMinimumWidth(84)
+        self.cancel_button.setMinimumWidth(100)
+        self.cancel_button.setToolTip("Cancel the current preview or automatic action.")
         self.cancel_button.hide()
+        self.pause_button = self._button("Pause", self.pause_requested.emit)
+        self.pause_button.setMinimumWidth(88)
+        self.pause_button.setToolTip("Pause at the next safe point.")
+        self.pause_button.hide()
         self.open_full_app_button = self._button("Open Full App", self.show_full_app)
         self.open_full_app_button.setMinimumWidth(118)
         self.open_full_app_button.hide()
@@ -426,10 +461,12 @@ class SyncEngineView(QtWidgets.QMainWindow):
             qt_enum(QtWidgets.QSizePolicy, "Policy", "Fixed"),
         )
         for button in (
-            self.open_full_app_button, self.cancel_button, self.preview_button, self.sync_button,
+            self.open_full_app_button, self.pause_button, self.cancel_button,
+            self.preview_button, self.sync_button,
         ):
             button.setSizePolicy(button_policy)
         footer_layout.addWidget(self.open_full_app_button)
+        footer_layout.addWidget(self.pause_button)
         footer_layout.addWidget(self.cancel_button)
         footer_layout.addWidget(self.preview_button)
         footer_layout.addWidget(self.sync_button)
@@ -581,9 +618,22 @@ class SyncEngineView(QtWidgets.QMainWindow):
         ))
         form.addRow("Timestamp Tolerance", self.timestamp_tolerance)
         layout.addWidget(comparison)
+        preview_details = QtWidgets.QGroupBox("Preview Details")
+        preview_details_layout = QtWidgets.QVBoxLayout(preview_details)
+        self.list_skipped_folder_contents = QtWidgets.QCheckBox(
+            "List Contents of Skipped Folders"
+        )
+        self.list_skipped_folder_contents.setToolTip(multiline_tooltip(
+            "By default, skipped folders appear as one row without scanning their contents. "
+            "Enable this option to list everything inside them as skipped. This can take longer "
+            "on large or slow drives; the listed contents remain outside the sync scope."
+        ))
+        preview_details_layout.addWidget(self.list_skipped_folder_contents)
+        layout.addWidget(preview_details)
         hint = QtWidgets.QLabel(
-            "Update and Mirror copy changed files. Two-way merges both folders using saved history. "
-            "Add only preserves every existing destination file."
+            "Update and Mirror copy changed files. Move transfers files to the destination and removes them "
+            "from the source. Two-way merges both folders using saved history. Add only preserves every "
+            "existing destination file."
         )
         hint.setWordWrap(True)
         hint.setObjectName("mutedLabel")
@@ -600,8 +650,9 @@ class SyncEngineView(QtWidgets.QMainWindow):
         ))
         safety_layout.addWidget(self.allow_empty_mirror)
         warning = QtWidgets.QLabel(
-            "Mirror removes destination extras. Two-way sync propagates file deletions from either side. "
-            "Both modes ask before manual deletion; automatic actions require explicit permission."
+            "Mirror removes destination extras. Move removes transferred files from the source. Two-way sync "
+            "propagates file deletions from either side. These modes ask before manual removals; automatic "
+            "actions require explicit permission."
         )
         warning.setWordWrap(True)
         warning.setObjectName("mutedLabel")
@@ -629,6 +680,15 @@ class SyncEngineView(QtWidgets.QMainWindow):
             "unchanged files, conflicts, exclusions, bytes, and errors."
         )
         execution_layout.addRow(self.generate_report)
+        self.skip_source_removal_confirmation = QtWidgets.QCheckBox(
+            "Skip Prompt Before Removing Source After Copy Verification"
+        )
+        self.skip_source_removal_confirmation.setToolTip(multiline_tooltip(
+            "For manual Move runs, the destination copy is completed and verified before SyncEngine "
+            "asks whether to remove the original source file. Enable this to skip that post-copy prompt. "
+            "The initial sync confirmation remains. Automatic runs still require explicit removal permission."
+        ))
+        execution_layout.addRow(self.skip_source_removal_confirmation)
         layout.addWidget(execution)
         layout.addStretch()
         return page
@@ -910,7 +970,10 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.countdown_seconds.setRange(0, 86400)
         self.countdown_seconds.setValue(10)
         self.countdown_seconds.setSuffix(" seconds")
-        self.countdown_seconds.setToolTip("The Cancel button stays available throughout the countdown and the run.")
+        self.countdown_seconds.setToolTip(
+            "Cancel remains available during the countdown and preview. While files are being applied, "
+            "Pause and Stop are available."
+        )
         self.countdown_label = QtWidgets.QLabel("Countdown")
         form.addRow(self.countdown_label, self.countdown_seconds)
         self.start_minimized = QtWidgets.QCheckBox("Start the Window Minimized")
@@ -926,10 +989,10 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.automation_mode_hint.setWordWrap(True)
         form.addRow("", self.automation_mode_hint)
         self.automation_mirror = QtWidgets.QCheckBox(
-            "Allow File Deletions in Automatic Actions"
+            "Allow File Removals and Moves in Automatic Actions"
         )
         self.automation_mirror.setToolTip(multiline_tooltip(
-            "Explicitly permits removals for Mirror and Two-way pairs in an automatic action. "
+            "Explicitly permits removals for Mirror, Move, and Two-way pairs in an automatic action. "
             "Review a successful preview before enabling this option."
         ))
         form.addRow("", self.automation_mirror)
@@ -993,6 +1056,12 @@ class SyncEngineView(QtWidgets.QMainWindow):
         for column, width in enumerate((130, 150, 230, 300, 70, 135)):
             self.preview_table.setColumnWidth(column, width)
         self.preview_table.setItemDelegateForColumn(5, _PreviewProgressDelegate(self.preview_table))
+        self.preview_table.setContextMenuPolicy(
+            qt_enum(QtCore.Qt, "ContextMenuPolicy", "CustomContextMenu")
+        )
+        self.preview_table.customContextMenuRequested.connect(
+            self._show_preview_table_context_menu
+        )
         header.setMinimumSectionSize(42)
         self.preview_table.viewport_resized.connect(self._fill_preview_table)
         header.sectionResized.connect(self._fill_preview_table)
@@ -1018,6 +1087,12 @@ class SyncEngineView(QtWidgets.QMainWindow):
             self.preview_tree.setColumnWidth(column, width)
         self.preview_tree.setColumnWidth(1, 150)
         self.preview_tree.setItemDelegateForColumn(4, _PreviewProgressDelegate(self.preview_tree))
+        self.preview_tree.setContextMenuPolicy(
+            qt_enum(QtCore.Qt, "ContextMenuPolicy", "CustomContextMenu")
+        )
+        self.preview_tree.customContextMenuRequested.connect(
+            self._show_preview_tree_context_menu
+        )
         tree_header.setMinimumSectionSize(42)
         self.preview_tree.viewport_resized.connect(self._fill_preview_tree_columns)
         tree_header.sectionResized.connect(self._fill_preview_tree_columns)
@@ -1057,7 +1132,124 @@ class SyncEngineView(QtWidgets.QMainWindow):
         """
         self.preview_stack.setCurrentIndex(max(0, index))
         self._update_conflict_buttons()
-        self._edited()
+        if not self._loading:
+            self.preview_view_changed.emit(str(self.preview_mode_combo.currentData() or "table"))
+
+    def _show_preview_tree_context_menu(self, position):
+        """Shows recursive tree actions and a source-folder shortcut for one row."""
+        item = self.preview_tree.itemAt(position)
+        if item is None:
+            return
+        self.preview_tree.setCurrentItem(item)
+        menu = QtWidgets.QMenu(self)
+        expand_action = menu.addAction("Expand Recursively")
+        collapse_action = menu.addAction("Collapse Recursively")
+        has_children = item.childCount() > 0
+        expand_action.setEnabled(has_children)
+        collapse_action.setEnabled(has_children)
+        expand_action.triggered.connect(
+            lambda checked=False, target=item: self._queue_recursive_tree_expansion(target, True)
+        )
+        collapse_action.triggered.connect(
+            lambda checked=False, target=item: self._queue_recursive_tree_expansion(target, False)
+        )
+        menu.addSeparator()
+        pair_id = str(item.data(0, self._data_role + 2) or "")
+        relative_path = str(item.data(0, self._data_role + 3) or "")
+        entry_type = str(item.data(0, self._data_role + 4) or "folder")
+        source_folder = self._source_folder_for_preview(pair_id, relative_path, entry_type)
+        open_action = menu.addAction("Open Source Folder in Explorer")
+        open_action.setEnabled(bool(source_folder))
+        open_action.triggered.connect(
+            lambda checked=False, path=source_folder: self._open_source_folder(path)
+        )
+        runner = getattr(menu, "exec", None) or menu.exec_
+        runner(self.preview_tree.mapToGlobal(position))
+
+    def _show_preview_table_context_menu(self, position):
+        """Shows the source-folder shortcut for the preview row under the pointer."""
+        row = self.preview_table.rowAt(position.y())
+        if row < 0 or row >= len(self._preview_displayed):
+            return
+        self.preview_table.selectRow(row)
+        operation = self._preview_displayed[row]
+        pair_id = str(operation.get("pair_id", ""))
+        relative_path = str(operation.get("relative_path", ""))
+        entry_type = operation.get("entry_type")
+        if entry_type is None:
+            entry_type = (
+                "folder"
+                if operation.get("kind", operation.get("action")) in ("mkdir", "rmdir")
+                else "file"
+            )
+        source_folder = self._source_folder_for_preview(
+            pair_id, relative_path, entry_type, source_path=operation.get("source")
+        )
+        menu = QtWidgets.QMenu(self)
+        open_action = menu.addAction("Open Source Folder in Explorer")
+        open_action.setEnabled(bool(source_folder))
+        open_action.triggered.connect(
+            lambda checked=False, path=source_folder: self._open_source_folder(path)
+        )
+        runner = getattr(menu, "exec", None) or menu.exec_
+        runner(self.preview_table.mapToGlobal(position))
+
+    def _source_folder_for_preview(self, pair_id, relative_path, entry_type, source_path=None):
+        """Resolves the source-side folder represented by a preview row."""
+        pair = next(
+            (item for item in self._preview_pairs if str(item.get("id", "")) == pair_id),
+            {},
+        )
+        source_root = str(pair.get("source", ""))
+        if not source_root:
+            return ""
+        path = str(source_path or "")
+        if not path:
+            components = [part for part in str(relative_path).replace("\\", "/").split("/") if part]
+            path = os.path.join(source_root, *components) if components else source_root
+        if entry_type != "folder":
+            path = os.path.dirname(path)
+        return path
+
+    def _open_source_folder(self, path):
+        """Opens the selected source-side folder in the platform file browser."""
+        if not path:
+            self.set_status("The source folder is not available for this preview item.", "warning")
+            return
+        opened = QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+        if opened:
+            self.set_status(f"Opened source folder: {path}", "success")
+        else:
+            self.set_status(f"Could not open the source folder: {path}", "error")
+
+    def _queue_recursive_tree_expansion(self, item, expanded):
+        """Starts a recursive expand or collapse that yields between small batches."""
+        self._recursive_tree_timer.stop()
+        self._recursive_tree_items = [item]
+        self._recursive_tree_index = 0
+        self._recursive_tree_expanded = bool(expanded)
+        self._recursive_tree_timer.start()
+
+    def _cancel_recursive_tree_expansion(self):
+        """Stops pending tree expansion before the preview items are replaced."""
+        self._recursive_tree_timer.stop()
+        self._recursive_tree_items = []
+        self._recursive_tree_index = 0
+
+    def _process_recursive_tree_expansion(self):
+        """Expands or collapses a bounded number of tree items per timer tick."""
+        batch_end = min(self._recursive_tree_index + 100, len(self._recursive_tree_items))
+        while self._recursive_tree_index < batch_end:
+            item = self._recursive_tree_items[self._recursive_tree_index]
+            self._recursive_tree_index += 1
+            item.setExpanded(self._recursive_tree_expanded)
+            self._recursive_tree_items.extend(
+                item.child(index) for index in range(item.childCount())
+            )
+        if self._recursive_tree_index >= len(self._recursive_tree_items):
+            self._recursive_tree_timer.stop()
+            self._recursive_tree_items = []
+            self._recursive_tree_index = 0
 
     def _preview_tree_selection_changed(self, current, previous):
         """Refreshes conflict choices when the hierarchy selection changes.
@@ -1240,11 +1432,13 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.folders_page.changed.connect(self._edited)
         self.variables_table.cellChanged.connect(self._edited)
         self.compare_combo.currentIndexChanged.connect(self._edited)
+        self.list_skipped_folder_contents.toggled.connect(self._edited)
         self.timestamp_tolerance.valueChanged.connect(self._edited)
         self.allow_empty_mirror.toggled.connect(self._edited)
         self.timeout_seconds.valueChanged.connect(self._edited)
         self.expand_log_while_syncing.toggled.connect(self._edited)
         self.generate_report.toggled.connect(self._edited)
+        self.skip_source_removal_confirmation.toggled.connect(self._edited)
         self.automation_start_mode.currentIndexChanged.connect(self._automation_mode_changed)
         self.automation_start_mode.currentIndexChanged.connect(self._edited)
         self.countdown_seconds.valueChanged.connect(self._edited)
@@ -1284,12 +1478,18 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.plan_name.setText(values.get("name", ""))
         self._set_combo(self.preview_mode_combo, values.get("preview_view", "table"))
         self._set_combo(self.compare_combo, values.get("compare", "metadata"))
+        self.list_skipped_folder_contents.setChecked(
+            bool(values.get("list_skipped_folder_contents", False))
+        )
         self.timestamp_tolerance.setValue(float(values.get("timestamp_tolerance", 0)))
         self.allow_empty_mirror.setChecked(bool(values.get("allow_empty_mirror", False)))
         execution = values.get("execution", {})
         self.timeout_seconds.setValue(int(execution.get("timeout_seconds", 0)))
         self.expand_log_while_syncing.setChecked(bool(execution.get("expand_log_while_syncing", False)))
         self.generate_report.setChecked(bool(execution.get("generate_report", False)))
+        self.skip_source_removal_confirmation.setChecked(bool(
+            execution.get("skip_source_removal_confirmation", False)
+        ))
         self._set_combo(self.automation_start_mode, automation.get("start_mode", "countdown"))
         self.countdown_seconds.setValue(int(automation.get("countdown_seconds", 10)))
         self.start_minimized.setChecked(bool(automation.get("start_minimized", False)))
@@ -1352,12 +1552,14 @@ class SyncEngineView(QtWidgets.QMainWindow):
         result["name"] = self.plan_name.text().strip()
         result["preview_view"] = self.preview_mode_combo.currentData() or "table"
         result["compare"] = self.compare_combo.currentData()
+        result["list_skipped_folder_contents"] = self.list_skipped_folder_contents.isChecked()
         result["timestamp_tolerance"] = self.timestamp_tolerance.value()
         result["allow_empty_mirror"] = self.allow_empty_mirror.isChecked()
         result["execution"] = {
             "timeout_seconds": self.timeout_seconds.value(),
             "expand_log_while_syncing": self.expand_log_while_syncing.isChecked(),
             "generate_report": self.generate_report.isChecked(),
+            "skip_source_removal_confirmation": self.skip_source_removal_confirmation.isChecked(),
         }
         result["automation"] = {
             "start_mode": self.automation_start_mode.currentData(),
@@ -1424,21 +1626,46 @@ class SyncEngineView(QtWidgets.QMainWindow):
             self.plan_edited.emit()
 
 
-    def set_busy(self, busy):
+    def set_busy(self, busy, syncing=False):
         """Locks plan editing while leaving cancellation and logs available.
 
         Args:
             busy (bool): Whether a countdown or background operation is active.
+            syncing (bool): Whether the active operation is applying a sync.
         """
         self._busy = bool(busy)
+        self._syncing = self._busy and bool(syncing)
         self._countdown_total = None
         self._refresh_enabled()
         self._update_conflict_buttons()
         self.cancel_button.setVisible(self._busy)
         self.cancel_button.setEnabled(self._busy)
-        self.cancel_button.setText("Cancel")
+        self.cancel_button.setText("Stop" if self._syncing else "Cancel")
+        self.cancel_button.setToolTip(
+            "Stop at the next safe point. An unfinished file is discarded; completed changes are retained."
+            if self._syncing
+            else "Cancel the current preview or automatic action."
+        )
+        self.pause_button.setVisible(self._syncing)
+        self.pause_button.setEnabled(self._syncing)
+        self.pause_button.setText("Pause")
+        self.pause_button.setToolTip("Pause at the next safe point.")
         self._update_progress_panel_visibility()
         self._refresh_run_mode_visibility()
+
+    def set_paused(self, paused):
+        """Updates the pause control to offer the opposite action."""
+        self.pause_button.setText("Resume" if paused else "Pause")
+        self.pause_button.setToolTip(
+            "Resume the sync." if paused else "Pause at the next safe point."
+        )
+
+    def set_cancel_pending(self):
+        """Shows that the active operation is stopping at a safe checkpoint."""
+        self.cancel_button.setText("Stopping…")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setToolTip("Waiting for the current safe checkpoint.")
+        self.pause_button.setEnabled(False)
 
     def set_automatic_run_mode(self, enabled=True):
         """Shows the compact preview and progress layout for automatic actions.
@@ -1472,6 +1699,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.preview_button.setVisible(not compact)
         self.sync_button.setVisible(not compact)
         self.cancel_button.setVisible(self._busy)
+        self.pause_button.setVisible(self._syncing)
         self.unsaved_label.setVisible(not compact and self._dirty and self._plan is not None)
         if hasattr(self, "log_panel"):
             self.log_panel.setVisible(not compact)
@@ -1526,13 +1754,24 @@ class SyncEngineView(QtWidgets.QMainWindow):
 
     def clear_preview(self):
         """Clears stale preview rows after settings or plan selection changes."""
+        self._preview_render_timer.stop()
+        self._preview_completion_timer.stop()
+        self._cancel_recursive_tree_expansion()
+        self._pending_preview_completions = []
+        self._preview_render_state = None
+        self._preview_tree_progress_snapshot = {}
         self._preview_generation_active = False
         self._preview_scan_rows = {}
+        self._preview_scan_tree_items = {}
+        self._preview_scan_tree_roots = {}
         self.preview_table.setRowCount(0)
         self.preview_tree.clear()
         self._preview_displayed = []
         self._preview_pairs = []
         self._preview_operations = []
+        self._preview_tree_items = {}
+        self._preview_tree_roots = {}
+        self._preview_tree_paths = {}
         self._preview_completion_items = {}
         self._preview_execution_status = {}
         self._preview_progress_items = {"table": {}, "tree": {}}
@@ -1544,31 +1783,50 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.use_source_button.setEnabled(False)
         self.use_backup_button.setEnabled(False)
 
-    def begin_preview_generation(self):
-        """Shows a live scan table while the full preview is being assembled."""
+    def begin_preview_generation(self, plan=None):
+        """Shows both live preview presentations while the scan is assembled.
+
+        Args:
+            plan (dict or None): Current edited plan used for live tree labels.
+        """
+        self._preview_render_timer.stop()
+        self._preview_completion_timer.stop()
+        self._cancel_recursive_tree_expansion()
+        self._pending_preview_completions = []
+        self._preview_render_state = None
+        self._preview_tree_progress_snapshot = {}
         self._preview_generation_active = True
         self._preview_scan_rows = {}
+        self._preview_scan_tree_items = {}
+        self._preview_scan_tree_roots = {}
         self.preview_table.setUpdatesEnabled(False)
         self.preview_table.setRowCount(0)
         self.preview_table.setUpdatesEnabled(True)
         self.preview_tree.clear()
         self._preview_displayed = []
-        self._preview_pairs = []
+        preview_plan = plan or self._plan or {}
+        self._preview_pairs = copy.deepcopy(preview_plan.get("pairs", []))
         self._preview_operations = []
         self._preview_progress_items = {"table": {}, "tree": {}}
         self._preview_completion_items = {}
         self._preview_execution_status = {}
         self._preview_tree_items = {}
+        self._preview_tree_roots = {}
+        self._preview_tree_paths = {}
         self.preview_summary.setText("Generating preview…")
         self.summary_label.clear()
         self.preview_note.setText(
-            "SyncEngine is scanning the folders. The table refreshes as items are discovered."
+            "SyncEngine is scanning the folders. The table and folder tree refresh as items are discovered."
         )
         self._has_preview_summary = True
         self.settings_tabs.setCurrentWidget(self.preview_page)
-        self.preview_stack.setCurrentIndex(0)
+        self.preview_stack.setCurrentIndex(max(0, self.preview_mode_combo.currentIndex()))
         self._update_footer_visibility()
         self._update_progress_panel_visibility()
+
+    def is_preview_rendering(self):
+        """Returns whether the completed preview is still being drawn in batches."""
+        return self._preview_render_state is not None
 
     def update_preview_scan_item(self, data):
         """Refreshes one recently discovered entry in the temporary scan table.
@@ -1588,6 +1846,13 @@ class SyncEngineView(QtWidgets.QMainWindow):
         if row is None:
             if self.preview_table.rowCount() >= self._preview_scan_row_limit:
                 self.preview_table.removeRow(0)
+                oldest_key = next(
+                    (row_key for row_key, old_row in self._preview_scan_rows.items() if old_row == 0),
+                    None,
+                )
+                if oldest_key is not None:
+                    self._preview_scan_rows.pop(oldest_key, None)
+                    self._remove_preview_scan_tree_item(oldest_key)
                 self._preview_scan_rows = {
                     row_key: old_row - 1
                     for row_key, old_row in self._preview_scan_rows.items()
@@ -1627,12 +1892,115 @@ class SyncEngineView(QtWidgets.QMainWindow):
             item.setBackground(QtGui.QColor(background))
             item.setForeground(QtGui.QColor(foreground))
         self.preview_table.setUpdatesEnabled(True)
+        self._update_preview_scan_tree_item(key, data, kind)
         if self.preview_table.rowCount() >= self._preview_scan_row_limit:
             self.preview_note.setText(
                 f"Generating preview. Showing the most recent {self._preview_scan_row_limit:,} discovered items; "
                 "the completed preview will include the full results."
             )
         self._fill_preview_table()
+
+    def _update_preview_scan_tree_item(self, key, data, kind):
+        """Updates one discovered scan row in the live folder hierarchy.
+
+        Args:
+            key (tuple): Pair identifier and normalized relative path.
+            data (dict): Current scan progress for the discovered entry.
+            kind (str): Either scanning or skipped.
+        """
+        pair_id = key[0]
+        relative_path = str(data.get("relative_path", "")).replace("\\", "/").strip("/")
+        components = [component for component in relative_path.split("/") if component]
+        if not components:
+            return
+        pair = next(
+            (item for item in self._preview_pairs if str(item.get("id", "")) == pair_id), {}
+        )
+        pair_name = data.get("pair_name") or pair.get("name") or "Folder Pair"
+        self.preview_tree.setUpdatesEnabled(False)
+        root = self._preview_scan_tree_roots.get(pair_id)
+        if root is None:
+            root = QtWidgets.QTreeWidgetItem([pair_name, "", "", "", ""])
+            root.setIcon(0, padded_icon("icons/menu_folder.svg"))
+            root.setToolTip(
+                0,
+                f"Source folder: {pair.get('source', '(path not set)')}\n"
+                f"Backup folder: {pair.get('destination', '(path not set)')}",
+            )
+            self.preview_tree.addTopLevelItem(root)
+            self._preview_scan_tree_roots[pair_id] = root
+        root.setData(0, self._data_role + 2, pair_id)
+        root.setData(0, self._data_role + 3, "")
+        root.setData(0, self._data_role + 4, "folder")
+        root.setData(0, self._data_role + 5, "source")
+        root.setExpanded(True)
+        parent = root
+        prefix_parts = []
+        item = None
+        for index, component in enumerate(components):
+            prefix_parts.append(component)
+            path_key = (pair_id, "/".join(prefix_parts).casefold())
+            item = self._preview_scan_tree_items.get(path_key)
+            if item is None:
+                item = QtWidgets.QTreeWidgetItem([component, "", "", "", ""])
+                parent.addChild(item)
+                self._preview_scan_tree_items[path_key] = item
+            parent.setExpanded(True)
+            parent = item
+            is_directory = index < len(components) - 1 or data.get("entry_type") == "folder"
+            item.setData(0, self._data_role + 4, "folder" if is_directory else "file")
+            item.setData(0, self._data_role + 2, pair_id)
+            item.setData(0, self._data_role + 3, "/".join(prefix_parts))
+            item.setData(0, self._data_role + 5, "source")
+            item.setIcon(
+                0,
+                padded_icon("icons/menu_folder.svg" if is_directory else "icons/menu_file.svg"),
+            )
+        scan_side = str(data.get("scan_side", "folder")).title()
+        item.setText(1, "Skipped" if kind == "skipped" else f"Scanning {scan_side}")
+        item.setText(2, data.get("reason") or f"Scanning {data.get('scan_side', 'folder')} contents…")
+        item.setText(3, "")
+        background, foreground = _PREVIEW_ROW_COLORS.get(
+            "skipped" if kind == "skipped" else "unchanged", ("#2c3033", "#c5c9cc")
+        )
+        for column in range(self.preview_tree.columnCount()):
+            item.setBackground(column, QtGui.QColor(background))
+            item.setForeground(column, QtGui.QColor(foreground))
+            item.setToolTip(column, item.text(column))
+        self.preview_tree.setUpdatesEnabled(True)
+
+    def _remove_preview_scan_tree_item(self, key):
+        """Drops an evicted live row while retaining folders with visible children.
+
+        Args:
+            key (tuple): Pair identifier and normalized relative path.
+        """
+        item = self._preview_scan_tree_items.get(key)
+        if item is None:
+            return
+        if item.childCount():
+            item.setText(1, "")
+            item.setText(2, "")
+            return
+        parent = item.parent()
+        if parent is not None:
+            parent.removeChild(item)
+        else:
+            index = self.preview_tree.indexOfTopLevelItem(item)
+            if index >= 0:
+                self.preview_tree.takeTopLevelItem(index)
+        self._preview_scan_tree_items.pop(key, None)
+        while parent is not None and parent.childCount() == 0:
+            if any(parent is root for root in self._preview_scan_tree_roots.values()):
+                break
+            grandparent = parent.parent()
+            for path_key, candidate in list(self._preview_scan_tree_items.items()):
+                if candidate is parent:
+                    self._preview_scan_tree_items.pop(path_key, None)
+            if grandparent is not None:
+                grandparent.removeChild(parent)
+            parent = grandparent
+        self.preview_tree.setUpdatesEnabled(True)
 
     def _update_conflict_buttons(self):
         """Enables conflict choices only when a conflict row is selected."""
@@ -1695,6 +2063,8 @@ class SyncEngineView(QtWidgets.QMainWindow):
         change_label = _PREVIEW_LABELS.get(kind, str(kind).title())
         if kind in ("copy", "update"):
             change_label = f"{change_label} to {target_label.title()}"
+        elif kind == "move":
+            change_label = f"Move File to {target_label.title()}"
         elif kind == "delete":
             change_label = f"Remove {target_label.title()} File"
         elif kind == "mkdir":
@@ -1706,8 +2076,12 @@ class SyncEngineView(QtWidgets.QMainWindow):
             side = operation.get("side", "source")
             if not reason:
                 reason = "Excluded by rule: matched an Exclude filter."
-            elif not reason.startswith("Not matched by any Include rule") and not reason.startswith(
-                    "Not inside a folder selected"):
+            elif not reason.startswith((
+                    "Not matched by any Include rule",
+                    "Not inside a folder selected",
+                    "Inside skipped folder",
+                    "This folder's source counterpart",
+            )):
                 reason = f"Excluded by rule: {reason}"
             reason = f"{reason} ({side})"
         size = (
@@ -1724,90 +2098,102 @@ class SyncEngineView(QtWidgets.QMainWindow):
             displayed (list[dict]): Operations, unchanged rows, and exclusions.
             pairs (list[dict]): Resolved folder-pair definitions from the preview.
         """
-        self.preview_tree.setUpdatesEnabled(False)
-        self.preview_tree.clear()
         pair_by_id = {str(pair.get("id", "")): pair for pair in pairs}
         pair_names = {
             pair_id: pair.get("name") or f"Pair {index + 1}"
             for index, (pair_id, pair) in enumerate(pair_by_id.items())
         }
-        root_items = {}
-        path_items = {}
+        self.preview_tree.setUpdatesEnabled(False)
+        self.preview_tree.clear()
         self._preview_tree_items = {}
+        self._preview_tree_roots = {}
+        self._preview_tree_paths = {}
         for operation in displayed:
-            pair_id = str(operation.get("pair_id", ""))
-            pair = pair_by_id.get(pair_id, {})
-            kind = operation.get("kind", operation.get("action", ""))
-            target_root = operation.get("target_root")
-            if target_root not in ("source", "destination"):
-                target_root = "source" if kind == "skipped" and operation.get("side") == "source" else "destination"
-            root_key = (pair_id, target_root)
-            root = root_items.get(root_key)
-            if root is None:
-                pair_name = pair_names.get(pair_id, operation.get("pair_name") or "Folder Pair")
-                side_label = "Source" if target_root == "source" else "Backup"
-                target_path = pair.get(target_root) or "(path not set)"
-                root = QtWidgets.QTreeWidgetItem([
-                    f"{pair_name} — {self._display_target_path(target_path)}", "", "", "", "",
-                ])
-                root.setIcon(0, padded_icon("icons/menu_folder.svg"))
-                root.setToolTip(
-                    0, f"{side_label} folder: {target_path}\nFolder pair: {pair_name}"
-                )
-                self.preview_tree.addTopLevelItem(root)
-                root_items[root_key] = root
-
-            relative_path = str(operation.get("relative_path", "")).replace("\\", "/").strip("/")
-            if not relative_path:
-                target_item = root
-                prefix_parts = []
-            else:
-                components = [part for part in relative_path.split("/") if part]
-                parent = root
-                prefix_parts = []
-                target_item = None
-                for index, component in enumerate(components):
-                    prefix_parts.append(component)
-                    prefix = "/".join(prefix_parts).casefold()
-                    is_directory = (
-                        index < len(components) - 1
-                        or kind in ("mkdir", "rmdir")
-                        or operation.get("entry_type") == "folder"
-                    )
-                    node_key = (root_key, prefix)
-                    target_item = path_items.get(node_key)
-                    if target_item is None:
-                        target_item = QtWidgets.QTreeWidgetItem([component, "", "", "", ""])
-                        parent.addChild(target_item)
-                        path_items[node_key] = target_item
-                    parent = target_item
-                    target_item.setData(0, self._data_role + 4, "folder" if is_directory else "file")
-                    target_item.setIcon(
-                        0,
-                        padded_icon(
-                            "icons/menu_folder.svg" if is_directory else "icons/menu_file.svg"
-                        ),
-                    )
-
-            change_label, reason, size = self._preview_values(operation)
-            target_item.setText(1, change_label)
-            target_item.setText(2, reason)
-            target_item.setText(3, size)
-            for column, value in enumerate((target_item.text(0), change_label, reason, size, "")):
-                target_item.setToolTip(column, str(value))
-                background, foreground = _PREVIEW_ROW_COLORS.get(kind, ("#2c3033", "#c5c9cc"))
-                target_item.setBackground(column, QtGui.QColor(background))
-                target_item.setForeground(column, QtGui.QColor(foreground))
-            operation_key = (
-                pair_id, target_root, relative_path.casefold().replace("\\", "/")
-            )
-            self._preview_tree_items[operation_key] = target_item
-            if kind == "conflict":
-                target_item.setData(1, self._data_role + 1, "conflict")
-                target_item.setData(1, self._data_role + 2, operation.get("pair_id", ""))
-                target_item.setData(1, self._data_role + 3, operation.get("relative_path", ""))
-        self.preview_tree.expandToDepth(1)
+            self._add_preview_tree_operation(operation, pair_by_id, pair_names)
+        self.preview_tree.expandToDepth(0)
         self.preview_tree.setUpdatesEnabled(True)
+
+    def _add_preview_tree_operation(self, operation, pair_by_id, pair_names):
+        """Adds one preview row to the hierarchy, creating missing path nodes."""
+        pair_id = str(operation.get("pair_id", ""))
+        pair = pair_by_id.get(pair_id, {})
+        kind = operation.get("kind", operation.get("action", ""))
+        target_root = operation.get("target_root")
+        if kind == "skipped":
+            target_root = "source" if operation.get("side") == "destination" else "destination"
+        elif target_root not in ("source", "destination"):
+            target_root = "destination"
+        root_key = (pair_id, target_root)
+        root = self._preview_tree_roots.get(root_key)
+        if root is None:
+            pair_name = pair_names.get(pair_id, operation.get("pair_name") or "Folder Pair")
+            side_label = "Source" if target_root == "source" else "Backup"
+            target_path = pair.get(target_root) or "(path not set)"
+            root = QtWidgets.QTreeWidgetItem([
+                f"{pair_name} — {self._display_target_path(target_path)}", "", "", "", "",
+            ])
+            root.setIcon(0, padded_icon("icons/menu_folder.svg"))
+            root.setToolTip(0, f"{side_label} folder: {target_path}\nFolder pair: {pair_name}")
+            root.setData(0, self._data_role + 2, pair_id)
+            root.setData(0, self._data_role + 3, "")
+            root.setData(0, self._data_role + 4, "folder")
+            root.setData(0, self._data_role + 5, target_root)
+            self.preview_tree.addTopLevelItem(root)
+            self._preview_tree_roots[root_key] = root
+
+        relative_path = str(operation.get("relative_path", "")).replace("\\", "/").strip("/")
+        if not relative_path:
+            target_item = root
+        else:
+            components = [part for part in relative_path.split("/") if part]
+            parent = root
+            prefix_parts = []
+            target_item = None
+            for index, component in enumerate(components):
+                prefix_parts.append(component)
+                prefix = "/".join(prefix_parts).casefold()
+                is_directory = (
+                    index < len(components) - 1
+                    or kind in ("mkdir", "rmdir")
+                    or operation.get("entry_type") == "folder"
+                )
+                node_key = (root_key, prefix)
+                target_item = self._preview_tree_paths.get(node_key)
+                if target_item is None:
+                    target_item = QtWidgets.QTreeWidgetItem([component, "", "", "", ""])
+                    parent.addChild(target_item)
+                    self._preview_tree_paths[node_key] = target_item
+                parent = target_item
+                target_item.setData(0, self._data_role + 4, "folder" if is_directory else "file")
+                target_item.setData(0, self._data_role + 2, pair_id)
+                target_item.setData(0, self._data_role + 3, "/".join(prefix_parts))
+                target_item.setData(0, self._data_role + 5, target_root)
+                target_item.setIcon(
+                    0, padded_icon("icons/menu_folder.svg" if is_directory else "icons/menu_file.svg")
+                )
+
+        change_label, reason, size = self._preview_values(operation)
+        target_item.setData(0, self._data_role + 2, pair_id)
+        target_item.setData(0, self._data_role + 3, relative_path)
+        target_item.setData(0, self._data_role + 4, "folder" if (
+            kind in ("mkdir", "rmdir") or operation.get("entry_type") == "folder"
+            or not relative_path
+        ) else "file")
+        target_item.setData(0, self._data_role + 5, target_root)
+        target_item.setText(1, change_label)
+        target_item.setText(2, reason)
+        target_item.setText(3, size)
+        background, foreground = _PREVIEW_ROW_COLORS.get(kind, ("#2c3033", "#c5c9cc"))
+        for column, value in enumerate((target_item.text(0), change_label, reason, size, "")):
+            target_item.setToolTip(column, str(value))
+            target_item.setBackground(column, QtGui.QColor(background))
+            target_item.setForeground(column, QtGui.QColor(foreground))
+        operation_key = (pair_id, target_root, relative_path.casefold())
+        self._preview_tree_items[operation_key] = target_item
+        if kind == "conflict":
+            target_item.setData(1, self._data_role + 1, "conflict")
+            target_item.setData(1, self._data_role + 2, operation.get("pair_id", ""))
+            target_item.setData(1, self._data_role + 3, operation.get("relative_path", ""))
 
     def _display_target_path(self, path):
         """Shortens a target path according to the saved preview preference."""
@@ -1836,11 +2222,13 @@ class SyncEngineView(QtWidgets.QMainWindow):
                 values = [value for value in values if value is not None]
                 if values:
                     progress_by_path[path_key] = max(values)
-            self._fill_preview_tree(self._preview_displayed, self._preview_pairs)
-            self._fill_tree_progress_items(self._preview_operations, self._preview_pairs)
-            for path_key, value in progress_by_path.items():
-                for item in self._preview_progress_items["tree"].get(path_key, []):
-                    item.setData(4, progress_role, value)
+            active_state = self._preview_render_state
+            render_table = bool(active_state and active_state.get("render_table"))
+            self._start_preview_render(
+                render_table=render_table,
+                render_tree=True,
+                progress_snapshot=progress_by_path,
+            )
 
     def set_preview(self, preview):
         """Displays every planned, unchanged, preserved, and excluded item.
@@ -1856,90 +2244,197 @@ class SyncEngineView(QtWidgets.QMainWindow):
         if not operations and not unchanged and not skipped and not summary and not warnings:
             self.clear_preview()
             return
+        self._cancel_recursive_tree_expansion()
         removed = summary.get("delete", 0) + summary.get("rmdir", 0)
         label = (
             f"{summary.get('copy', 0):,} new · {summary.get('update', 0):,} changed · "
-            f"{removed:,} removed · {summary.get('unchanged', 0):,} unchanged · "
+            f"{summary.get('move', 0):,} moved · {removed:,} removed · "
+            f"{summary.get('unchanged', 0):,} unchanged · "
             f"{summary.get('conflict', 0):,} conflicts · "
             f"{summary.get('skipped', len(skipped)):,} skipped · "
-            f"{format_bytes(summary.get('bytes', 0))} to copy"
+            f"{format_bytes(summary.get('bytes', 0))} to transfer"
         )
         self.preview_summary.setText(label)
         self.summary_label.setText(
             f"{summary.get('copy', 0) + summary.get('update', 0):,} copies · "
-            f"{removed:,} removals · {summary.get('skipped', len(skipped)):,} skipped · "
+            f"{summary.get('move', 0):,} moves · {removed:,} removals · "
+            f"{summary.get('skipped', len(skipped)):,} skipped · "
             f"{format_bytes(summary.get('bytes', 0))}"
         )
         self._has_preview_summary = True
+        self._preview_render_timer.stop()
+        self._preview_render_state = None
         self._preview_generation_active = False
         self._preview_scan_rows = {}
+        self._preview_scan_tree_items = {}
+        self._preview_scan_tree_roots = {}
         self._update_footer_visibility()
         displayed = list(operations) + list(unchanged) + list(skipped)
         self._preview_displayed = displayed
         self._preview_operations = operations
-        self.preview_table.setUpdatesEnabled(False)
-        self.preview_table.setRowCount(len(displayed))
-        self._preview_progress_items = {"table": {}, "tree": {}}
+        self._preview_pairs = preview.get("plan", {}).get("pairs") or self.folders_page.get_pairs()
         self._preview_completion_items = {}
         self._preview_execution_status = {}
         self._preview_tree_items = {}
-        pairs = preview.get("plan", {}).get("pairs") or self.folders_page.get_pairs()
-        pair_names = {str(pair.get("id", "")): pair.get("name") or f"Pair {index + 1}"
-                      for index, pair in enumerate(pairs)}
-        for row, operation in enumerate(displayed):
-            kind = operation.get("kind", operation.get("action", ""))
-            change_label, reason, size = self._preview_values(operation)
-            values = (
-                change_label,
-                operation.get("pair_name") or pair_names.get(operation.get("pair_id"), ""),
-                operation.get("relative_path", ""),
-                reason,
-                size,
-                "",
-            )
-            background, foreground = _PREVIEW_ROW_COLORS.get(kind, ("#2c3033", "#c5c9cc"))
-            for column, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(str(value))
-                item.setToolTip(str(value))
-                item.setBackground(QtGui.QColor(background))
-                item.setForeground(QtGui.QColor(foreground))
-                if kind == "conflict" and column == 0:
-                    item.setData(self._data_role + 1, "conflict")
-                    item.setData(self._data_role + 2, operation.get("pair_id", ""))
-                    item.setData(self._data_role + 3, operation.get("relative_path", ""))
-                self.preview_table.setItem(row, column, item)
-            progress_item = self.preview_table.item(row, 5)
-            if kind in ("copy", "update", "delete", "mkdir", "rmdir"):
-                for operation_path in (operation.get("source"), operation.get("destination")):
-                    self._register_preview_progress_item("table", operation_path, progress_item)
-        self.preview_table.setUpdatesEnabled(True)
-        self._preview_pairs = pairs
-        self._fill_preview_tree(displayed, pairs)
-        self._fill_tree_progress_items(operations, pairs)
-        self._resize_preview_columns_to_contents(self.preview_table, compact_columns=(4,))
-        self._resize_preview_columns_to_contents(self.preview_tree, compact_columns=(3,))
-        self._fill_preview_table()
-        self._fill_preview_tree_columns()
         notes = []
         if skipped:
+            list_skipped_contents = bool(
+                (preview.get("plan") or {}).get("list_skipped_folder_contents", False)
+            )
+            skipped_folder_note = (
+                "Contents inside skipped folders were listed as skipped."
+                if list_skipped_contents
+                else "Folders rejected by Exclude rules are not scanned for their contents."
+            )
             notes.append(
-                f"{len(skipped):,} items were filtered by Include or Exclude rules and are listed as Skipped. "
-                "Folders rejected by Exclude rules are not scanned for their contents."
+                f"{len(skipped):,} items remain outside the sync scope and are listed as Skipped. "
+                f"{skipped_folder_note}"
             )
         if summary.get("conflict"):
             notes.insert(0, f"{summary['conflict']:,} conflict(s) need a choice before this sync can run.")
         if warnings:
             notes.append("\n".join(str(warning) for warning in warnings[:5]))
-        self.preview_note.setText(
-            "\n".join(notes)
-            or "Every scanned item is listed with its planned outcome and reason."
+        self._preview_final_note = "\n".join(notes) or (
+            "Every scanned item is listed with its planned outcome and reason."
         )
+        self.preview_note.setText(self._preview_final_note)
         self.use_source_button.setEnabled(False)
         self.use_backup_button.setEnabled(False)
         self.settings_tabs.setCurrentWidget(self.preview_page)
         self.preview_stack.setCurrentIndex(self.preview_mode_combo.currentIndex())
         self._update_progress_panel_visibility()
         self._update_conflict_buttons()
+        self._start_preview_render(render_table=True, render_tree=True)
+
+    def _start_preview_render(self, render_table, render_tree, progress_snapshot=None):
+        """Schedules both preview presentations in bounded GUI-thread batches."""
+        self._preview_render_timer.stop()
+        displayed = self._preview_displayed
+        pairs = self._preview_pairs
+        pair_by_id = {str(pair.get("id", "")): pair for pair in pairs}
+        pair_names = {
+            pair_id: pair.get("name") or f"Pair {index + 1}"
+            for index, (pair_id, pair) in enumerate(pair_by_id.items())
+        }
+        self._preview_tree_progress_snapshot = dict(progress_snapshot or {})
+        if render_table:
+            self.preview_table.setUpdatesEnabled(False)
+            self.preview_table.setRowCount(0)
+            self.preview_table.setUpdatesEnabled(True)
+            self._preview_progress_items["table"] = {}
+        if render_tree:
+            self.preview_tree.setUpdatesEnabled(False)
+            self.preview_tree.clear()
+            self.preview_tree.setUpdatesEnabled(True)
+            self._preview_progress_items["tree"] = {}
+            self._preview_completion_items = {}
+            self._preview_tree_items = {}
+            self._preview_tree_roots = {}
+            self._preview_tree_paths = {}
+        self._preview_render_state = {
+            "index": 0,
+            "render_table": bool(render_table),
+            "render_tree": bool(render_tree),
+            "pair_by_id": pair_by_id,
+            "pair_names": pair_names,
+        }
+        if not displayed:
+            self._finish_preview_render()
+            return
+        if render_table:
+            self.preview_table.setRowCount(min(len(displayed), self._preview_render_batch_size))
+        self.preview_note.setText(f"Preparing preview display: 0 / {len(displayed):,} items.")
+        self._preview_render_timer.start()
+
+    def _render_preview_batch(self):
+        """Adds a bounded set of preview rows, then yields to the Qt event loop."""
+        state = self._preview_render_state
+        if state is None:
+            self._preview_render_timer.stop()
+            return
+        displayed = self._preview_displayed
+        start = state["index"]
+        end = min(start + self._preview_render_batch_size, len(displayed))
+        self.preview_table.setUpdatesEnabled(not state["render_table"])
+        self.preview_tree.setUpdatesEnabled(not state["render_tree"])
+        try:
+            if state["render_table"] and self.preview_table.rowCount() < end:
+                self.preview_table.setRowCount(end)
+            for row in range(start, end):
+                operation = displayed[row]
+                if state["render_table"]:
+                    self._set_preview_table_row(row, operation, state["pair_names"])
+                if state["render_tree"]:
+                    self._add_preview_tree_operation(
+                        operation, state["pair_by_id"], state["pair_names"]
+                    )
+                    if row < len(self._preview_operations):
+                        self._register_tree_operation_progress(
+                            row, operation, state["pair_by_id"]
+                        )
+        finally:
+            self.preview_table.setUpdatesEnabled(True)
+            self.preview_tree.setUpdatesEnabled(True)
+        state["index"] = end
+        self.preview_note.setText(
+            f"Preparing preview display: {end:,} / {len(displayed):,} items."
+        )
+        if end >= len(displayed):
+            self._finish_preview_render()
+
+    def _set_preview_table_row(self, row, operation, pair_names):
+        """Populates one table row and associates its progress paths."""
+        kind = operation.get("kind", operation.get("action", ""))
+        change_label, reason, size = self._preview_values(operation)
+        values = (
+            change_label,
+            operation.get("pair_name") or pair_names.get(operation.get("pair_id"), ""),
+            operation.get("relative_path", ""),
+            reason,
+            size,
+            "",
+        )
+        background, foreground = _PREVIEW_ROW_COLORS.get(kind, ("#2c3033", "#c5c9cc"))
+        for column, value in enumerate(values):
+            item = QtWidgets.QTableWidgetItem(str(value))
+            item.setToolTip(str(value))
+            item.setBackground(QtGui.QColor(background))
+            item.setForeground(QtGui.QColor(foreground))
+            if kind == "conflict" and column == 0:
+                item.setData(self._data_role + 1, "conflict")
+                item.setData(self._data_role + 2, operation.get("pair_id", ""))
+                item.setData(self._data_role + 3, operation.get("relative_path", ""))
+            self.preview_table.setItem(row, column, item)
+        progress_item = self.preview_table.item(row, 5)
+        if kind in ("copy", "update", "delete", "move", "mkdir", "rmdir"):
+            for operation_path in (operation.get("source"), operation.get("destination")):
+                self._register_preview_progress_item("table", operation_path, progress_item)
+
+    def _finish_preview_render(self):
+        """Finalizes preview sizing and notifies the controller that rows are ready."""
+        self._preview_render_timer.stop()
+        state = self._preview_render_state
+        if state is None:
+            return
+        self._preview_render_state = None
+        if state["render_tree"]:
+            self.preview_tree.expandToDepth(0)
+        if len(self._preview_displayed) <= 100:
+            if state["render_table"]:
+                self._resize_preview_columns_to_contents(self.preview_table, compact_columns=(4,))
+                self._fill_preview_table()
+            if state["render_tree"]:
+                self._resize_preview_columns_to_contents(self.preview_tree, compact_columns=(3,))
+                self._fill_preview_tree_columns()
+        else:
+            if state["render_table"]:
+                self._fill_preview_table()
+            if state["render_tree"]:
+                self._fill_preview_tree_columns()
+        self.preview_note.setText(getattr(self, "_preview_final_note", ""))
+        self._preview_tree_progress_snapshot = {}
+        self._update_conflict_buttons()
+        self.preview_render_finished.emit()
 
     def _resize_preview_columns_to_contents(self, widget, compact_columns=()):
         """Measures preview data before fitting every column to the viewport.
@@ -1968,42 +2463,46 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self._preview_completion_items = {}
         pairs_by_id = {str(pair.get("id", "")): pair for pair in pairs}
         for row, operation in enumerate(operations):
-            kind = operation.get("kind", operation.get("action", ""))
-            if kind not in ("copy", "update", "delete", "mkdir", "rmdir"):
-                continue
-            pair = pairs_by_id.get(str(operation.get("pair_id", "")), {})
-            target_root = operation.get("target_root", "destination")
-            if target_root not in ("source", "destination"):
-                target_root = "destination"
-            relative_path = str(operation.get("relative_path", "")).replace("\\", "/").strip("/")
-            tree_item = self._preview_tree_items.get((
-                str(operation.get("pair_id", "")), target_root, relative_path.casefold()
-            ))
-            if tree_item is None:
-                continue
-            preview_key = (
-                str(operation.get("pair_id", "")), target_root, relative_path.casefold()
-            )
-            destination = operation.get("destination")
-            if destination:
-                destination_key = ntpath.normpath(str(destination)).casefold()
-                completion_items = self._preview_completion_items.setdefault(destination_key, [])
-                completion_items.append({
-                    "kind": kind, "row": row, "tree_item": tree_item, "preview_key": preview_key,
-                })
-            tree_item.setText(4, "")
-            tree_item.setData(4, self._data_role, None)
-            completed_label = self._preview_execution_status.get(preview_key)
-            if completed_label:
-                self._set_preview_item_completed(row, tree_item, completed_label)
-            self._register_preview_progress_item("tree", operation.get("source"), tree_item)
-            self._register_preview_progress_item("tree", operation.get("destination"), tree_item)
-            target_base = pair.get(target_root, "")
-            if relative_path:
-                target_path = ntpath.join(target_base, relative_path)
-            else:
-                target_path = target_base
-            self._register_preview_progress_item("tree", target_path, tree_item)
+            self._register_tree_operation_progress(row, operation, pairs_by_id)
+
+    def _register_tree_operation_progress(self, row, operation, pairs_by_id):
+        """Associates one tree row with progress and completed-operation state."""
+        kind = operation.get("kind", operation.get("action", ""))
+        if kind not in ("copy", "update", "delete", "move", "mkdir", "rmdir"):
+            return
+        pair_id = str(operation.get("pair_id", ""))
+        pair = pairs_by_id.get(pair_id, {})
+        target_root = operation.get("target_root", "destination")
+        if target_root not in ("source", "destination"):
+            target_root = "destination"
+        relative_path = str(operation.get("relative_path", "")).replace("\\", "/").strip("/")
+        preview_key = (pair_id, target_root, relative_path.casefold())
+        tree_item = self._preview_tree_items.get(preview_key)
+        if tree_item is None:
+            return
+        destination = operation.get("destination")
+        if destination:
+            destination_key = ntpath.normpath(str(destination)).casefold()
+            completion_items = self._preview_completion_items.setdefault(destination_key, [])
+            completion_items.append({
+                "kind": kind, "row": row, "tree_item": tree_item, "preview_key": preview_key,
+            })
+        if kind == "move" and operation.get("source"):
+            source_key = ntpath.normpath(str(operation["source"])).casefold()
+            source_completion_items = self._preview_completion_items.setdefault(source_key, [])
+            source_completion_items.append({
+                "kind": kind, "row": row, "tree_item": tree_item, "preview_key": preview_key,
+            })
+        tree_item.setText(4, "")
+        tree_item.setData(4, self._data_role, None)
+        completed_label = self._preview_execution_status.get(preview_key)
+        if completed_label:
+            self._set_preview_item_completed(row, tree_item, completed_label)
+        self._register_preview_progress_item("tree", operation.get("source"), tree_item)
+        self._register_preview_progress_item("tree", operation.get("destination"), tree_item)
+        target_base = pair.get(target_root, "")
+        target_path = ntpath.join(target_base, relative_path) if relative_path else target_base
+        self._register_preview_progress_item("tree", target_path, tree_item)
 
     def _register_preview_progress_item(self, mode, path, item):
         """Associates a source or target path with its preview progress cell."""
@@ -2013,6 +2512,8 @@ class SyncEngineView(QtWidgets.QMainWindow):
         items = self._preview_progress_items[mode].setdefault(key, [])
         if item not in items:
             items.append(item)
+        if mode == "tree" and key in self._preview_tree_progress_snapshot:
+            item.setData(4, self._data_role, self._preview_tree_progress_snapshot[key])
 
     def _update_preview_item_progress(self, data):
         """Updates per-operation bars in both preview presentations."""
@@ -2037,7 +2538,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
             else:
                 self.preview_tree.viewport().update()
 
-    def _mark_preview_operation_complete(self, data):
+    def _mark_preview_operation_complete(self, data, refresh=True):
         """Changes a preview row from its planned action to its completed action."""
         phase = data.get("phase", data.get("stage", ""))
         message = str(data.get("message", ""))
@@ -2045,26 +2546,51 @@ class SyncEngineView(QtWidgets.QMainWindow):
         if phase == "copy":
             match = re.match(r"^Completed (copy|update|mkdir):", message)
             if match is None:
-                return
+                return False
             completed_kind = match.group(1)
+        elif phase == "delete" and message.startswith("Moved "):
+            completed_kind = "move"
         elif phase == "delete" and message.startswith("Removed "):
             completed_kind = None
         else:
-            return
+            return False
         if not current_path:
-            return
+            return False
         path_key = ntpath.normpath(str(current_path)).casefold()
+        changed = False
         for entry in self._preview_completion_items.get(path_key, []):
             kind = entry["kind"]
             if phase == "copy" and kind != completed_kind:
                 continue
-            if phase == "delete" and kind not in ("delete", "rmdir"):
+            if phase == "delete" and kind not in ("delete", "rmdir", "move"):
                 continue
             label = _EXECUTED_PREVIEW_LABELS[kind]
             self._preview_execution_status[entry["preview_key"]] = label
             self._set_preview_item_completed(entry["row"], entry["tree_item"], label)
-        self.preview_table.viewport().update()
-        self.preview_tree.viewport().update()
+            changed = True
+        if changed and refresh:
+            self.preview_table.viewport().update()
+            self.preview_tree.viewport().update()
+        return changed
+
+    def mark_preview_operations_complete(self, completed_items):
+        """Queues completed file and folder operations for bounded GUI updates."""
+        self._pending_preview_completions.extend(completed_items)
+        if self._pending_preview_completions and not self._preview_completion_timer.isActive():
+            self._preview_completion_timer.start()
+
+    def _process_preview_completion_batch(self):
+        """Applies a bounded set of completed operations without monopolizing Qt."""
+        batch = self._pending_preview_completions[:self._preview_completion_batch_size]
+        del self._pending_preview_completions[:len(batch)]
+        changed = False
+        for item in batch:
+            changed = self._mark_preview_operation_complete(item, refresh=False) or changed
+        if changed:
+            self.preview_table.viewport().update()
+            self.preview_tree.viewport().update()
+        if not self._pending_preview_completions:
+            self._preview_completion_timer.stop()
 
     def _set_preview_item_completed(self, row, tree_item, label):
         """Shows the executed result and a completed per-item bar in both views."""
@@ -2097,7 +2623,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self._mark_preview_operation_complete(data)
         titles = {
             "scan": "Scanning folders", "compare": "Comparing files", "copy": "Copying files",
-            "delete": "Removing destination extras", "finished": "Finished", "cancelled": "Cancelled",
+            "delete": "Removing source files and destination extras", "finished": "Finished", "cancelled": "Cancelled",
             "failed": "Stopped", "timed_out": "Timed out", "succeeded": "Finished",
             "countdown": "Automatic sync countdown",
         }
@@ -2402,6 +2928,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
             "and Include or Exclude rules, "
             "change previews, and scheduled actions.\n\n"
             "Add only preserves existing files. Update replaces changed files. Mirror removes destination extras. "
+            "Move transfers source files and removes them after verification. "
             "Two-way sync merges changes from both folders and asks before resolving conflicting edits."
         )
 

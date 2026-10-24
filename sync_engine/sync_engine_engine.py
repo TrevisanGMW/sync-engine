@@ -1,8 +1,9 @@
 """Read-only backup previews and conservative, cancellable file synchronization.
 
-Only the standard library is used. Source files are never changed. Filtered
-files and folders, symbolic links and Windows reparse points are outside the
-synchronization scope, including removal in mirror mode.
+Only the standard library is used. Move mode removes source files only after
+their destination versions are verified. Filtered files and folders, symbolic
+links and Windows reparse points are outside the synchronization scope,
+including removal in mirror mode.
 """
 
 import copy
@@ -13,12 +14,13 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 
 from sync_engine_model import normalize_exclusions, resolve_plan_paths
 
 
 CHUNK_SIZE = 1024 * 1024
-OPERATION_KINDS = {"copy", "update", "delete", "mkdir", "rmdir", "conflict"}
+OPERATION_KINDS = {"copy", "update", "move", "delete", "mkdir", "rmdir", "conflict"}
 LOGGER = logging.getLogger("sync_engine")
 
 
@@ -27,16 +29,59 @@ class SyncError(Exception):
 
 
 class SyncCancelled(SyncError):
-    """Raised when cancellation is requested during preview creation."""
+    """Raised when cancellation is requested during preview or sync work."""
+
+
+class OperationControl:
+    """Coordinates cooperative cancellation and pausing at safe checkpoints."""
+
+    def __init__(self):
+        self._cancel_event = threading.Event()
+        self._resume_event = threading.Event()
+        self._resume_event.set()
+
+    def is_set(self):
+        """Returns whether cancellation was requested."""
+        return self._cancel_event.is_set()
+
+    def set(self):
+        """Requests cancellation and releases a paused operation."""
+        self._cancel_event.set()
+        self._resume_event.set()
+
+    @property
+    def is_paused(self):
+        """Whether the operation is currently held at a checkpoint."""
+        return not self._resume_event.is_set() and not self.is_set()
+
+    def pause(self):
+        """Requests a pause at the next engine checkpoint."""
+        if not self.is_set():
+            self._resume_event.clear()
+
+    def resume(self):
+        """Allows a paused operation to continue."""
+        self._resume_event.set()
+
+    def wait_if_paused(self):
+        """Waits without blocking the UI thread and exits promptly on cancel."""
+        while not self._resume_event.wait(0.1):
+            if self.is_set():
+                return
 
 
 def _check_cancel(cancel_event):
-    """Stops work when the supplied cancellation event is set.
+    """Pauses at a safe point and stops if the cancellation event is set.
 
     Args:
-        cancel_event (threading.Event or None): Cooperative cancellation flag.
+        cancel_event (threading.Event, OperationControl, or None): Cooperative control.
     """
-    if cancel_event is not None and cancel_event.is_set():
+    if cancel_event is None:
+        return
+    wait_if_paused = getattr(cancel_event, "wait_if_paused", None)
+    if wait_if_paused is not None:
+        wait_if_paused()
+    if cancel_event.is_set():
         raise SyncCancelled("Synchronization cancelled.")
 
 
@@ -146,7 +191,7 @@ def _prepare_pairs(plan):
         if not isinstance(pair_id, str) or not pair_id or pair_id in used_ids:
             raise SyncError("Every folder pair must have a unique, nonempty ID.")
         used_ids.add(pair_id)
-        if pair.get("mode", "update") not in ("add", "update", "mirror", "two_way"):
+        if pair.get("mode", "update") not in ("add", "update", "mirror", "move", "two_way"):
             raise SyncError(f"Unknown backup mode for pair '{pair_id}'.")
         normalized = copy.deepcopy(pair)
         try:
@@ -368,7 +413,31 @@ def _relative_key(relative_path):
     return os.path.normcase(relative_path).replace("\\", "/")
 
 
-def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, scan_side=None):
+def _iter_directory_entries(directory_path):
+    """Yields entries as the operating system returns them.
+
+    Keeping directory enumeration streaming lets preview progress appear before
+    a slow or large directory has been read in full.
+
+    Args:
+        directory_path (str): Directory to enumerate.
+
+    Yields:
+        os.DirEntry: One filesystem entry.
+
+    Raises:
+        SyncError: The directory cannot be read.
+    """
+    try:
+        with os.scandir(directory_path) as iterator:
+            for entry in iterator:
+                yield entry
+    except OSError as error:
+        raise SyncError(f"Cannot read folder '{directory_path}': {error}") from error
+
+
+def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, scan_side=None,
+          list_skipped_folder_contents=False):
     """Scans a directory without following links or hiding enumeration failures.
 
     Args:
@@ -377,6 +446,7 @@ def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, sca
         cancel_event (threading.Event or None): Cancellation flag.
         progress_callback (callable or None): Receives scan progress.
         protected_paths (set[str] or None): Additional excluded subtrees.
+        list_skipped_folder_contents (bool): Whether to enumerate skipped folder descendants.
 
     Returns:
         dict: Files, directories, protected paths, warnings and root identity.
@@ -395,7 +465,7 @@ def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, sca
     except OSError as error:
         raise SyncError(f"Cannot inspect folder '{root}': {error}") from error
     snapshot["root_signature"] = _signature(root_stat)
-    pending = [(root, "", False)]
+    pending = [(root, "", False, None)]
     directory_candidates = {}
     folder_include_rules = [
         item for item in pair.get("exclusions", [])
@@ -412,13 +482,8 @@ def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, sca
     seen_paths = set()
     while pending:
         _check_cancel(cancel_event)
-        directory_path, relative_directory, selected_folder_parent = pending.pop()
-        try:
-            with os.scandir(directory_path) as iterator:
-                entries = sorted(iterator, key=lambda entry: entry.name.casefold())
-        except OSError as error:
-            raise SyncError(f"Cannot read folder '{directory_path}': {error}") from error
-        for entry in entries:
+        directory_path, relative_directory, selected_folder_parent, skipped_folder_context = pending.pop()
+        for entry in _iter_directory_entries(directory_path):
             _check_cancel(cancel_event)
             scanned_entries += 1
             actual_relative_path = f"{relative_directory}/{entry.name}" if relative_directory else entry.name
@@ -436,6 +501,7 @@ def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, sca
             except OSError as error:
                 raise SyncError(f"Cannot inspect '{entry.path}': {error}") from error
             is_directory = stat.S_ISDIR(entry_stat.st_mode)
+            is_link = _is_link(entry_stat)
             entry_type = "folder" if is_directory else "file"
             progress_values = {
                 "phase": "scan", "pair_id": pair.get("id"), "scan_side": scan_side,
@@ -443,11 +509,60 @@ def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, sca
                 "scanned_entries": scanned_entries, "scanned_files": scanned_files,
                 "current_path": entry.path,
             }
-            if _protected(relative_path, protected_paths) or _is_link(entry_stat):
+            if skipped_folder_context is not None:
+                snapshot["excluded"] += 1
+                reason = (
+                    f"Inside skipped folder '{skipped_folder_context['relative_path']}'."
+                )
+                snapshot["skipped"].append({
+                    "relative_path": actual_relative_path,
+                    "entry_type": entry_type,
+                    "rule": copy.deepcopy(skipped_folder_context.get("rule")),
+                    "reason": reason,
+                })
+                if is_link:
+                    snapshot["warnings"].append(
+                        f"Skipped linked or reparse-point entry: {entry.path}"
+                    )
+                elif is_directory:
+                    pending.append((
+                        entry.path, actual_relative_path, False, skipped_folder_context,
+                    ))
+                _report(
+                    progress_callback, **progress_values, kind="skipped",
+                    reason=reason, message=f"Listing skipped folder contents: {entry.name}",
+                )
+                continue
+
+            if _protected(relative_path, protected_paths) or is_link:
                 snapshot["protected"].append(relative_path)
                 snapshot["excluded"] += 1
-                if _is_link(entry_stat):
+                if is_link:
                     snapshot["warnings"].append(f"Skipped linked or reparse-point entry: {entry.path}")
+                protected_folder = next((
+                    protected_path for protected_path in protected_paths
+                    if relative_path == _relative_key(protected_path)
+                    and is_directory
+                ), None)
+                if (protected_folder is not None and list_skipped_folder_contents
+                        and not is_link):
+                    context = {
+                        "relative_path": actual_relative_path,
+                        "rule": None,
+                    }
+                    reason = "This folder's source counterpart is skipped by a filter."
+                    snapshot["skipped"].append({
+                        "relative_path": actual_relative_path,
+                        "entry_type": "folder",
+                        "rule": None,
+                        "reason": reason,
+                    })
+                    pending.append((entry.path, actual_relative_path, False, context))
+                    _report(
+                        progress_callback, **progress_values, kind="skipped",
+                        reason=reason, message=f"Listing skipped folder contents: {entry.name}",
+                    )
+                    continue
                 _report(
                     progress_callback, **progress_values,
                     kind="scanning", message="Scanning folders…",
@@ -461,11 +576,28 @@ def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, sca
                     "relative_path": actual_relative_path,
                     "entry_type": entry_type,
                     "rule": copy.deepcopy(rule),
+                    "reason": (
+                        _exclusion_reason(rule, entry_type).replace(
+                            "; contents are skipped without scanning",
+                            "; contents are listed as skipped",
+                        )
+                        if is_directory and list_skipped_folder_contents
+                        else _exclusion_reason(rule, entry_type)
+                    ),
                 })
+                if is_directory and list_skipped_folder_contents:
+                    pending.append((
+                        entry.path, actual_relative_path, False,
+                        {"relative_path": actual_relative_path, "rule": copy.deepcopy(rule)},
+                    ))
                 _report(
                     progress_callback, **progress_values, kind="skipped",
-                    reason=_exclusion_reason(rule, entry_type),
-                    message=f"Skipping excluded {entry_type}: {entry.name}",
+                    reason=snapshot["skipped"][-1]["reason"],
+                    message=(
+                        f"Listing skipped folder contents: {entry.name}"
+                        if is_directory and list_skipped_folder_contents
+                        else f"Skipping excluded {entry_type}: {entry.name}"
+                    ),
                 )
                 continue
             scan_kind = "scanning"
@@ -491,6 +623,7 @@ def _scan(root, pair, cancel_event, progress_callback, protected_paths=None, sca
                 pending.append((
                     entry.path, actual_relative_path,
                     bool(folder_include_rules and included_folder),
+                    None,
                 ))
             elif stat.S_ISREG(entry_stat.st_mode):
                 included_by_folder = selected_folder_parent
@@ -611,7 +744,7 @@ def _operation(kind, pair, relative_path, source_signature=None, destination_sig
     """Creates a serializable operation with its original file signatures.
 
     Args:
-        kind (str): Copy, update, delete, mkdir or rmdir.
+        kind (str): Copy, update, move, delete, mkdir or rmdir.
         pair (dict): Normalized folder pair.
         relative_path (str): Path relative to the pair roots.
         source_signature (dict or None): Original source file metadata.
@@ -628,7 +761,8 @@ def _operation(kind, pair, relative_path, source_signature=None, destination_sig
         "kind": kind, "pair_id": pair["id"], "relative_path": destination_relative_path,
         "source_relative_path": source_relative_path,
         "source_root": source_root, "target_root": target_root,
-        "source": _join(pair[source_root], source_relative_path) if kind in ("copy", "update") else "",
+        "source": _join(pair[source_root], source_relative_path)
+        if kind in ("copy", "update", "move") else "",
         "destination": _join(pair[target_root], destination_relative_path),
         "size": source_signature["size"] if source_signature else 0,
         "source_signature": copy.deepcopy(source_signature),
@@ -735,21 +869,40 @@ def _pair_operations(pair, source_snapshot, destination_snapshot, plan, cancel_e
         destination_signature = destination_files.get(relative_path)
         if destination_signature is None:
             destination_relative_path = _destination_spelling(source_paths[relative_path], planned_destination_paths)
-            operations.append(_operation(
-                "copy", pair, relative_path, source_signature, None,
-                source_paths[relative_path], destination_relative_path
-            ))
-        elif pair.get("mode", "update") == "add" or _same_file(
-            _join(pair["source"], source_paths[relative_path]),
-            _join(pair["destination"], destination_paths[relative_path]),
-            source_signature, destination_signature, plan, cancel_event, progress_callback
-        ):
+            if pair.get("mode") == "move":
+                operation = _operation(
+                    "move", pair, relative_path, source_signature, None,
+                    source_paths[relative_path], destination_relative_path,
+                )
+                operation["copy_action"] = "copy"
+                operations.append(operation)
+            else:
+                operations.append(_operation(
+                    "copy", pair, relative_path, source_signature, None,
+                    source_paths[relative_path], destination_relative_path
+                ))
+        elif pair.get("mode", "update") == "add":
             unchanged += 1
         else:
-            operations.append(_operation(
-                "update", pair, relative_path, source_signature, destination_signature,
-                source_paths[relative_path], destination_paths[relative_path]
-            ))
+            same_file = _same_file(
+                _join(pair["source"], source_paths[relative_path]),
+                _join(pair["destination"], destination_paths[relative_path]),
+                source_signature, destination_signature, plan, cancel_event, progress_callback
+            )
+            if pair.get("mode") == "move":
+                operation = _operation(
+                    "move", pair, relative_path, source_signature, destination_signature,
+                    source_paths[relative_path], destination_paths[relative_path],
+                )
+                operation["copy_action"] = None if same_file else "update"
+                operations.append(operation)
+            elif same_file:
+                unchanged += 1
+            else:
+                operations.append(_operation(
+                    "update", pair, relative_path, source_signature, destination_signature,
+                    source_paths[relative_path], destination_paths[relative_path]
+                ))
     if pair.get("mode", "update") == "mirror":
         for relative_path in sorted(set(destination_files).difference(source_files)):
             if (not _protected(relative_path, protected_paths)
@@ -790,7 +943,7 @@ def _unchanged_preview_rows(pair, source_snapshot, destination_snapshot, operati
     action_keys = {
         _relative_key(operation.get("relative_path", ""))
         for operation in operations
-        if operation.get("kind") in ("copy", "update", "delete", "conflict", "mkdir", "rmdir")
+        if operation.get("kind") in ("copy", "update", "move", "delete", "conflict", "mkdir", "rmdir")
     }
     rows = []
     pair_mode = pair.get("mode", "update")
@@ -1018,7 +1171,7 @@ def build_preview(plan, cancel_event=None, progress_callback=None, sync_state=No
     except ValueError as error:
         raise SyncError(str(error)) from error
     pairs = _prepare_pairs(plan)
-    summary = {key: 0 for key in ("copy", "update", "delete", "delete_source", "delete_destination",
+    summary = {key: 0 for key in ("copy", "update", "move", "delete", "delete_source", "delete_destination",
                                     "mkdir", "rmdir", "conflict", "unchanged", "excluded", "skipped", "bytes")}
     preview = {"operations": [], "unchanged": [], "skipped": [], "summary": summary, "warnings": [],
                "plan": plan, "snapshots": {}}
@@ -1028,13 +1181,15 @@ def build_preview(plan, cancel_event=None, progress_callback=None, sync_state=No
     for pair in pairs:
         _check_cancel(cancel_event)
         source_snapshot = _scan(
-            pair["source"], pair, cancel_event, progress_callback, scan_side="source"
+            pair["source"], pair, cancel_event, progress_callback, scan_side="source",
+            list_skipped_folder_contents=plan.get("list_skipped_folder_contents", False),
         )
         if source_snapshot["root_signature"] is None:
             raise SyncError(f"The source folder disappeared during scanning: {pair['source']}")
         destination_snapshot = _scan(
             pair["destination"], pair, cancel_event, progress_callback,
             set(source_snapshot["protected"]), scan_side="backup",
+            list_skipped_folder_contents=plan.get("list_skipped_folder_contents", False),
         )
         pair_result = _pair_operations(
             pair, source_snapshot, destination_snapshot, plan, cancel_event, progress_callback,
@@ -1066,7 +1221,9 @@ def build_preview(plan, cancel_event=None, progress_callback=None, sync_state=No
                         "kind": "skipped", "pair_id": pair["id"],
                         "relative_path": skipped["relative_path"],
                         "entry_type": skipped["entry_type"],
-                        "reason": _exclusion_reason(skipped["rule"], skipped["entry_type"]),
+                        "reason": skipped.get("reason") or _exclusion_reason(
+                            skipped.get("rule"), skipped["entry_type"]
+                        ),
                         "side": side,
                     }
                     preview["skipped"].append(skipped_row)
@@ -1078,13 +1235,20 @@ def build_preview(plan, cancel_event=None, progress_callback=None, sync_state=No
                 summary[operation["kind"]] += 1
             if operation["kind"] == "delete":
                 summary[f"delete_{operation.get('target_root', 'destination')}"] += 1
+            if operation["kind"] == "move":
+                summary["delete_source"] += 1
             if operation["kind"] in ("copy", "update"):
+                summary["bytes"] += operation["size"]
+            elif operation["kind"] == "move" and operation.get("copy_action"):
                 summary["bytes"] += operation["size"]
     summary["skipped"] = len(preview["skipped"])
     preview["skipped"].sort(key=lambda row: (row["pair_id"], row["relative_path"].casefold()))
     preview["unchanged"].sort(key=lambda row: (row["pair_id"], row["relative_path"].casefold()))
     preview["next_sync_state"] = state
-    phase_order = {"mkdir": 0, "copy": 1, "update": 1, "conflict": 2, "delete": 3, "rmdir": 4}
+    phase_order = {
+        "mkdir": 0, "copy": 1, "update": 1, "move": 2,
+        "conflict": 2, "delete": 3, "rmdir": 4,
+    }
     preview["operations"].sort(key=lambda operation: phase_order[operation["kind"]])
     _report(progress_callback, phase="finished", message="Comparison complete.",
             total_bytes=summary["bytes"], total_operations=len(preview["operations"]),
@@ -1162,12 +1326,22 @@ def _verify_preview(preview, pairs):
         expected_destination = _join(pair[target_root], operation.get("relative_path"))
         if os.path.normcase(expected_destination) != os.path.normcase(operation.get("destination", "")):
             raise SyncError("The preview contains an invalid destination path.")
-        if kind in ("copy", "update"):
+        if kind in ("copy", "update", "move"):
             expected_source = _join(
                 pair[source_root], operation.get("source_relative_path", operation["relative_path"])
             )
             if os.path.normcase(expected_source) != os.path.normcase(operation.get("source", "")):
                 raise SyncError("The preview contains an invalid source path.")
+        if kind == "move":
+            copy_action = operation.get("copy_action")
+            if (pair.get("mode") != "move" or target_root != "destination"
+                    or source_root != "source" or not operation["relative_path"]
+                    or not operation.get("source_signature")
+                    or copy_action not in (None, "copy", "update")
+                    or (copy_action is None and operation.get("destination_signature") is None)
+                    or (copy_action == "copy" and operation.get("destination_signature") is not None)
+                    or (copy_action == "update" and operation.get("destination_signature") is None)):
+                raise SyncError("The preview contains an invalid move operation.")
         if kind in ("delete", "rmdir") and (
             pair.get("mode") not in ("mirror", "two_way") or not operation["relative_path"]
         ):
@@ -1176,6 +1350,17 @@ def _verify_preview(preview, pairs):
             raise SyncError("Mirror removals may target the destination only.")
         if pair["id"] not in preview["snapshots"]:
             raise SyncError("The preview does not contain its original folder snapshots.")
+        if kind == "move":
+            source_relative_path = operation.get("source_relative_path", operation["relative_path"])
+            if _relative_key(source_relative_path) != _relative_key(operation["relative_path"]):
+                raise SyncError("The preview contains a move between different relative paths.")
+            pair_snapshots = preview["snapshots"][pair["id"]]
+            source_key = _relative_key(source_relative_path)
+            destination_key = _relative_key(operation["relative_path"])
+            if (pair_snapshots["source"]["files"].get(source_key) != operation["source_signature"]
+                    or pair_snapshots["destination"]["files"].get(destination_key)
+                    != operation.get("destination_signature")):
+                raise SyncError("The move operation no longer matches its preview snapshot.")
 
 
 def _revalidate_pairs(pairs, snapshots, cancel_event, progress_callback):
@@ -1219,15 +1404,16 @@ def _open_source(path, expected_signature):
         raise
 
 
-def _copy_atomic(operation, result, progress, cancel_event, progress_callback):
+def _copy_atomic(operation, result, progress, cancel_event, progress_callback, count_as_copy=True):
     """Copies to a temporary sibling and replaces the target only after verification.
 
     Args:
-        operation (dict): Copy or update operation.
+        operation (dict): Copy, update or move operation.
         result (dict): Aggregate result updated with copied bytes.
         progress (dict): Shared progress counters.
         cancel_event (threading.Event or None): Cancellation flag.
         progress_callback (callable or None): Receives chunk and file progress.
+        count_as_copy (bool): Whether to include this transfer in the copy count.
 
     Returns:
         dict: Signature of the completed destination file.
@@ -1273,7 +1459,8 @@ def _copy_atomic(operation, result, progress, cancel_event, progress_callback):
             raise SyncError(f"Source changed during copying; destination was preserved: {source}")
         os.replace(temporary_path, destination)
         temporary_path = None
-        result["copied"] += 1
+        if count_as_copy:
+            result["copied"] += 1
         result["bytes"] += file_completed
         return _file_signature(destination)
     finally:
@@ -1327,6 +1514,44 @@ def _guard_roots(pair, pair_snapshot):
             raise SyncError(f"Destination folder appeared since comparison: {root_path}")
 
 
+def _move_source_file(operation, pair, pair_snapshot, destination_signature, plan,
+                      cancel_event, progress_callback):
+    """Removes a source file only after its verified destination copy is present.
+
+    Args:
+        operation (dict): Reviewed move operation.
+        pair (dict): Normalized folder pair.
+        pair_snapshot (dict): Original source and updated destination snapshots.
+        destination_signature (dict): Expected signature of the completed target file.
+        plan (dict): Comparison settings.
+        cancel_event (threading.Event or None): Cooperative cancellation flag.
+        progress_callback (callable or None): Receives comparison progress.
+    """
+    source_path = operation["source"]
+    destination_path = operation["destination"]
+    _guard_roots(pair, pair_snapshot)
+    _validate_components(os.path.dirname(source_path))
+    _validate_components(os.path.dirname(destination_path))
+    if _file_signature(source_path) != operation["source_signature"]:
+        raise SyncError(f"Source changed before it could be moved; source preserved: {source_path}")
+    if _file_signature(destination_path) != destination_signature:
+        raise SyncError(f"Destination changed before source removal; source preserved: {destination_path}")
+    if not _same_file(
+        source_path, destination_path, operation["source_signature"], destination_signature,
+        plan, cancel_event, progress_callback,
+    ):
+        raise SyncError(f"Destination does not contain the source file; source preserved: {source_path}")
+    _check_cancel(cancel_event)
+    if (_file_signature(source_path) != operation["source_signature"]
+            or _file_signature(destination_path) != destination_signature):
+        raise SyncError(f"A file changed before move completion; source preserved: {source_path}")
+    os.unlink(source_path)
+    source_snapshot = pair_snapshot["source"]
+    source_key = _relative_key(operation.get("source_relative_path", operation["relative_path"]))
+    source_snapshot["files"].pop(source_key, None)
+    source_snapshot["paths"].pop(source_key, None)
+
+
 def _remove_entry(operation, pair, pair_snapshot):
     """Removes a still-unchanged file or a verified empty extra directory.
 
@@ -1362,24 +1587,28 @@ def _remove_entry(operation, pair, pair_snapshot):
     destination_snapshot["paths"].pop(_relative_key(operation["relative_path"]))
 
 
-def execute_preview(preview, cancel_event=None, progress_callback=None, allow_delete=False):
+def execute_preview(preview, cancel_event=None, progress_callback=None, allow_delete=False,
+                    source_removal_confirmation=None):
     """Executes a reviewed preview with revalidation, atomic copying and safe removal.
 
     All pairs are revalidated before the first write. All copies must succeed
-    before any mirror removals. Another complete scan before removal detects
-    additions or changes made while copying. Cancellation preserves completed
-    copies; in-progress copies leave their original destination untouched.
+    before mirror removals or source cleanup for moves. Another complete scan
+    before removal detects additions or changes made while copying. Cancellation
+    preserves completed copies; an unfinished move keeps its source file.
 
     Args:
         preview (dict): Result of build_preview.
         cancel_event (threading.Event or None): Cooperative cancellation flag.
         progress_callback (callable or None): Function receiving progress dictionaries.
-        allow_delete (bool): Explicit authorization to apply mirror removals.
+        allow_delete (bool): Explicit authorization for planned removals and moves.
+        source_removal_confirmation (callable or None): Optional callback called after move
+            destinations are verified and before source files are removed. Receives the
+            number of source files and returns whether removal is approved.
 
     Returns:
-        dict: Final status, copied/deleted file counts, bytes, errors and warnings.
+        dict: Final status, copied/moved/deleted file counts, bytes, errors and warnings.
     """
-    result = {"status": "succeeded", "copied": 0, "deleted": 0, "bytes": 0,
+    result = {"status": "succeeded", "copied": 0, "moved": 0, "deleted": 0, "bytes": 0,
               "errors": [], "warnings": list(preview.get("warnings", []))}
     progress = {"completed_bytes": 0, "total_bytes": preview.get("summary", {}).get("bytes", 0),
                 "completed_operations": 0, "total_operations": len(preview.get("operations", []))}
@@ -1392,16 +1621,18 @@ def execute_preview(preview, cancel_event=None, progress_callback=None, allow_de
         snapshots = copy.deepcopy(preview["snapshots"])
         operations = preview["operations"]
         deletions = [operation for operation in operations if operation["kind"] in ("delete", "rmdir")]
+        moves = [operation for operation in operations if operation["kind"] == "move"]
         unresolved = [operation["relative_path"] for operation in operations
                       if operation["kind"] == "conflict"]
         if unresolved:
             examples = ", ".join(unresolved[:8])
             suffix = "" if len(unresolved) <= 8 else f" and {len(unresolved) - 8} more"
             raise SyncError(f"Resolve every two-way conflict before syncing: {examples}{suffix}")
-        if deletions and not allow_delete:
+        if (deletions or moves) and not allow_delete:
             raise SyncError("This sync includes removals and needs explicit confirmation before syncing.")
         _revalidate_pairs(pairs, snapshots, cancel_event, progress_callback)
         additions = [operation for operation in operations if operation["kind"] not in ("delete", "rmdir")]
+        move_destination_signatures = {}
         for operation in additions:
             _check_cancel(cancel_event)
             _guard_roots(pair_lookup[operation["pair_id"]], snapshots[operation["pair_id"]])
@@ -1409,18 +1640,50 @@ def execute_preview(preview, cancel_event=None, progress_callback=None, allow_de
             destination_snapshot = snapshots[operation["pair_id"]][target_root]
             if operation["kind"] == "mkdir":
                 _make_directory(operation, destination_snapshot)
+            elif operation["kind"] == "move":
+                if operation.get("copy_action"):
+                    signature = _copy_atomic(
+                        operation, result, progress, cancel_event, progress_callback,
+                        count_as_copy=False,
+                    )
+                    relative_key = _relative_key(operation["relative_path"])
+                    destination_snapshot["files"][relative_key] = signature
+                    destination_snapshot["paths"][relative_key] = operation["relative_path"]
+                else:
+                    signature = operation["destination_signature"]
+                move_destination_signatures[(operation["pair_id"], _relative_key(
+                    operation["relative_path"]
+                ))] = signature
             else:
                 signature = _copy_atomic(operation, result, progress, cancel_event, progress_callback)
                 relative_key = _relative_key(operation["relative_path"])
                 destination_snapshot["files"][relative_key] = signature
                 destination_snapshot["paths"][relative_key] = operation["relative_path"]
-            progress["completed_operations"] += 1
-            LOGGER.info("%s: source=%s destination=%s", operation["kind"],
-                        operation.get("source", ""), operation["destination"])
-            _report(progress_callback, **progress, phase="copy", current_path=operation["destination"],
-                    message=f"Completed {operation['kind']}: {operation['relative_path'] or 'destination folder'}")
-        if deletions:
+            if operation["kind"] != "move":
+                progress["completed_operations"] += 1
+                LOGGER.info("%s: source=%s destination=%s", operation["kind"],
+                            operation.get("source", ""), operation["destination"])
+                _report(
+                    progress_callback, **progress, phase="copy", current_path=operation["destination"],
+                    message=f"Completed {operation['kind']}: "
+                    f"{operation['relative_path'] or 'destination folder'}",
+                )
+            elif operation.get("copy_action"):
+                LOGGER.info("Prepared move destination: %s", operation["destination"])
+                _report(
+                    progress_callback, **progress, phase="copy", current_path=operation["source"],
+                    message=f"Prepared move: {operation['relative_path']}",
+                )
+        if deletions or moves:
             _revalidate_pairs(pairs, snapshots, cancel_event, progress_callback)
+        remove_sources = True
+        if moves and source_removal_confirmation is not None:
+            remove_sources = bool(source_removal_confirmation(len(moves)))
+            if not remove_sources:
+                result["status"] = "cancelled"
+                result["warnings"].append(
+                    "Destination copies were verified; source files were kept because removal was declined."
+                )
         for operation in deletions:
             _check_cancel(cancel_event)
             _remove_entry(operation, pair_lookup[operation["pair_id"]], snapshots[operation["pair_id"]])
@@ -1430,6 +1693,25 @@ def execute_preview(preview, cancel_event=None, progress_callback=None, allow_de
             LOGGER.info("%s: destination=%s", operation["kind"], operation["destination"])
             _report(progress_callback, **progress, phase="delete", current_path=operation["destination"],
                     message=f"Removed {operation['relative_path']}")
+        if remove_sources:
+            for operation in moves:
+                _check_cancel(cancel_event)
+                pair = pair_lookup[operation["pair_id"]]
+                pair_snapshot = snapshots[operation["pair_id"]]
+                destination_signature = move_destination_signatures[(
+                    operation["pair_id"], _relative_key(operation["relative_path"])
+                )]
+                _move_source_file(
+                    operation, pair, pair_snapshot, destination_signature, preview["plan"],
+                    cancel_event, progress_callback,
+                )
+                result["moved"] += 1
+                progress["completed_operations"] += 1
+                LOGGER.info("Moved source=%s destination=%s", operation["source"], operation["destination"])
+                _report(
+                    progress_callback, **progress, phase="delete", current_path=operation["source"],
+                    message=f"Moved {operation['relative_path']} to destination",
+                )
     except SyncCancelled:
         result["status"] = "cancelled"
         result["warnings"].append("Cancelled. Completed operations were retained.")
@@ -1441,6 +1723,12 @@ def execute_preview(preview, cancel_event=None, progress_callback=None, allow_de
         try:
             result["sync_state"] = _state_after_sync(
                 pairs, preview.get("plan", {}), cancel_event, progress_callback
+            )
+        except SyncCancelled:
+            result["status"] = "cancelled"
+            result["warnings"].append(
+                "File changes completed, but the two-way history refresh was stopped. "
+                "Run Preview again before the next sync."
             )
         except (SyncError, OSError) as error:
             result["status"] = "failed"

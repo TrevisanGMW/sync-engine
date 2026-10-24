@@ -67,12 +67,14 @@ def new_plan(name="Untitled"):
         "variables": {},
         "compare": "metadata",
         "preview_view": "table",
+        "list_skipped_folder_contents": False,
         "timestamp_tolerance": 0.0,
         "allow_empty_mirror": False,
         "execution": {
             "timeout_seconds": 0,
             "expand_log_while_syncing": False,
             "generate_report": False,
+            "skip_source_removal_confirmation": False,
         },
         "automation": {
             "start_mode": "countdown",
@@ -454,6 +456,10 @@ def validate_plan(plan):
     if preview_view not in ("table", "tree"):
         raise ValueError("Preview view must be table or tree.")
     normalized["preview_view"] = preview_view
+    normalized["list_skipped_folder_contents"] = _boolean(
+        plan.get("list_skipped_folder_contents", False),
+        "List skipped folder contents",
+    )
     comparison = plan.get("compare", "metadata")
     if not isinstance(comparison, str) or comparison not in ("metadata", "content"):
         raise ValueError("Comparison must be metadata or content.")
@@ -483,6 +489,10 @@ def validate_plan(plan):
             execution.get("expand_log_while_syncing", False), "Expand log while syncing"
         ),
         "generate_report": _boolean(execution.get("generate_report", False), "Generate report"),
+        "skip_source_removal_confirmation": _boolean(
+            execution.get("skip_source_removal_confirmation", False),
+            "Skip source-removal confirmation",
+        ),
     }
     automation = plan.get("automation", {})
     if not isinstance(automation, dict):
@@ -516,7 +526,7 @@ def validate_plan(plan):
             raise ValueError("Plan and folder pair identifiers must be unique.")
         seen_identifiers.add(pair_id)
         mode = pair.get("mode", "update")
-        if not isinstance(mode, str) or mode not in ("add", "update", "mirror", "two_way"):
+        if not isinstance(mode, str) or mode not in ("add", "update", "mirror", "move", "two_way"):
             raise ValueError(f"Folder pair {position} has an unknown sync mode.")
         normalized["pairs"].append({
             "id": pair_id,
@@ -800,27 +810,28 @@ def duplicate_plan(plan):
 
 
 def save_action(plan, path, allow_mirror=False, allow_deletions=None):
-    """Exports a self-contained automatic action with explicit deletion permission.
+    """Exports a self-contained automatic action with explicit removal permission.
 
     Args:
         plan (dict): Plan embedded in the action.
         path (str or pathlib.Path): Destination action file.
-        allow_mirror (bool): Whether automatic deletion is explicitly authorized.
+        allow_mirror (bool): Legacy argument for automatic-removal authorization.
         allow_deletions (bool or None): Optional current name for the permission.
 
     Returns:
         None: The action is saved.
 
     Raises:
-        ValueError: If a mirror action lacks explicit deletion authorization.
+    ValueError: If a removal mode lacks explicit automatic-removal authorization.
     """
     normalized = validate_plan(plan)
     if allow_deletions is None:
         allow_deletions = allow_mirror
-    permission = _boolean(allow_deletions, "Automatic deletion permission")
-    has_deletion_mode = any(pair["mode"] in ("mirror", "two_way") for pair in normalized["pairs"])
+    permission = _boolean(allow_deletions, "Automatic removal permission")
+    has_deletion_mode = any(pair["mode"] in ("mirror", "move", "two_way")
+                            for pair in normalized["pairs"])
     if has_deletion_mode and not permission:
-        raise ValueError("Exporting this action requires explicit automatic deletion permission.")
+        raise ValueError("Exporting this action requires explicit automatic-removal permission.")
     normalized["automation"]["allow_deletions"] = permission
     _write_json({
         "file_type": "syncengine_action",
@@ -840,7 +851,7 @@ def load_action(path):
         dict: Embedded plan with resolved paths and validated authorization.
 
     Raises:
-        ValueError: If the action schema or mirror permission is invalid.
+        ValueError: If the action schema or removal permission is invalid.
     """
     action = _read_json(path)
     if not isinstance(action, dict) or action.get("file_type") not in (
@@ -856,8 +867,8 @@ def load_action(path):
     embedded_permission = normalized["automation"]["allow_deletions"]
     if permission != embedded_permission:
         raise ValueError("The action and embedded plan deletion permissions do not agree.")
-    if any(pair["mode"] in ("mirror", "two_way") for pair in normalized["pairs"]) and not permission:
-        raise ValueError("This action has no explicit automatic deletion permission.")
+    if any(pair["mode"] in ("mirror", "move", "two_way") for pair in normalized["pairs"]) and not permission:
+        raise ValueError("This action has no explicit automatic removal permission.")
     return _resolve_paths(normalized, path)
 
 
@@ -941,10 +952,13 @@ class PlanStore:
         self.logs_directory.mkdir(parents=True, exist_ok=True)
 
     def _migrate_legacy_plans(self):
-        """Copies legacy app data into the new project folder on first launch.
+        """Copies legacy app data into the new project folder once.
 
         Legacy plan files stay in place so another installation is unaffected.
         """
+        preferences = self.read_preferences()
+        if preferences.get("legacy_relay_plan_migration_complete"):
+            return
         legacy_base = self.preferences_directory / "legacy-migration-unavailable"
         if os.name == "nt" and self._is_default_preferences_directory(self.preferences_directory):
             local_app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
@@ -965,6 +979,11 @@ class PlanStore:
                 current_ids.add(plan["id"])
             except (OSError, ValueError) as error:
                 self.warnings.append(f"Could not import a legacy plan ({path.name}): {error}")
+        preferences["legacy_relay_plan_migration_complete"] = True
+        try:
+            self.write_preferences(preferences)
+        except OSError as error:
+            self.warnings.append(f"Could not save the legacy plan migration marker: {error}")
 
     def change_projects_directory(self, directory):
         """Switches project storage after copying plans and sync history safely.

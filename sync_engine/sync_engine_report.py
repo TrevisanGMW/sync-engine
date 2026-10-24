@@ -54,11 +54,13 @@ def build_sync_report(plan, preview, result, elapsed_seconds=0, log_path=""):
         "Summary",
         "-" * 60,
         f"Files transferred: {int(result.get('copied', 0)):,}",
+        f"Files moved: {int(result.get('moved', 0)):,}",
         f"Data transferred: {format_size(result.get('bytes', 0))}",
         f"Files removed: {int(result.get('deleted', 0)):,}",
         f"Already up to date: {int(summary.get('unchanged', 0)):,}",
         f"New files planned: {int(summary.get('copy', 0)):,}",
         f"Changed files planned: {int(summary.get('update', 0)):,}",
+        f"Files planned to move: {int(summary.get('move', 0)):,}",
         f"Removals planned: {planned_removed:,} files, {planned_folders:,} folders",
         f"Conflicts encountered: {int(summary.get('conflict', 0)):,} "
         f"({int(summary.get('conflict_resolved', 0)):,} resolved)",

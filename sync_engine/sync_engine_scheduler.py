@@ -479,12 +479,12 @@ class AutomaticRunsDialog(QtWidgets.QDialog):
             plan = self.store.load(self.plan_ids[self.plan_combo.currentIndex()])
             if any(not pair["source"] or not pair["destination"] for pair in plan["pairs"]):
                 raise ValueError("Set a source and destination for every folder pair before scheduling it.")
-            has_deletions = any(pair["mode"] in ("mirror", "two_way") for pair in plan["pairs"])
+            has_deletions = any(pair["mode"] in ("mirror", "move", "two_way") for pair in plan["pairs"])
             allow_deletions = False
             if has_deletions:
                 response = QtWidgets.QMessageBox.question(
-                    self, "Allow scheduled deletions?",
-                    "This plan can permanently remove files. Allow this scheduled task to apply "
+                    self, "Allow scheduled removals?",
+                    "This plan can permanently remove or move files. Allow this scheduled task to apply "
                     "the removals shown in its preview?",
                     qt_enum(QtWidgets.QMessageBox, "StandardButton", "Yes")
                     | qt_enum(QtWidgets.QMessageBox, "StandardButton", "No"),

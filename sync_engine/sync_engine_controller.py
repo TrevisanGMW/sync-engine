@@ -106,7 +106,7 @@ class SyncEngineController(QtCore.QObject):
             self.plan_file_path = str(store.plans_directory / f"{self.plan['id']}.syncplan")
         else:
             self.plan = new_plan()
-            self.plan_file_path = str(store.save(self.plan))
+            self.plan_file_path = str(store.plans_directory / f"{self.plan['id']}.syncplan")
         self.view.set_plans(store.list_plans(), self.plan["id"])
         self.view.set_plan(self.plan)
         self._close_after_automatic = bool(
@@ -151,6 +151,7 @@ class SyncEngineController(QtCore.QObject):
             "preview_requested": self._request_preview,
             "sync_requested": self._request_sync,
             "cancel_requested": self.cancel,
+            "pause_requested": self._toggle_pause,
             "plan_selected": self._select_plan,
             "plan_edited": self._plan_edited,
             "register_actions_requested": self._register_actions,
@@ -163,10 +164,12 @@ class SyncEngineController(QtCore.QObject):
             "variable_test_requested": self._test_variable,
             "path_feedback_requested": self._inspect_path,
             "conflict_resolution_requested": self._resolve_conflict,
+            "preview_view_changed": self._preview_view_changed,
             "closing": self._closing,
         }
         for signal_name, callback in connections.items():
             getattr(self.view, signal_name).connect(callback)
+        self.view.preview_render_finished.connect(self._preview_render_finished)
 
     def _refresh_plans(self):
         """Refresh the sidebar while retaining the current plan selection."""
@@ -191,8 +194,22 @@ class SyncEngineController(QtCore.QObject):
             self._conflicts_resolved = 0
             if self.preview is not None:
                 self.preview = None
+                self._run_after_preview = False
+                self._automatic = False
                 self.view.set_preview({"operations": [], "summary": {}, "warnings": []})
             self.view.set_status("")
+
+    @Slot(str)
+    def _preview_view_changed(self, mode):
+        """Marks a view preference dirty without invalidating preview data.
+
+        Args:
+            mode (str): Selected preview presentation.
+        """
+        if self.plan is None or mode not in ("table", "tree"):
+            return
+        self.dirty = True
+        self.view.set_unsaved_changes(True)
 
     def _save_plan(self, quiet=False):
         """Save this plan to user-local storage.
@@ -291,9 +308,7 @@ class SyncEngineController(QtCore.QObject):
             if plans:
                 self._set_plan(self.store.load(plans[0]["id"]))
             else:
-                plan = new_plan()
-                self.store.save(plan)
-                self._set_plan(plan)
+                self._set_plan(new_plan())
         except Exception as error:
             self._show_failure(error)
 
@@ -373,17 +388,17 @@ class SyncEngineController(QtCore.QObject):
 
     @Slot()
     def _export_action(self):
-        """Export an automatic action with explicit mirror authorization."""
+        """Exports an automatic action with explicit removal authorization."""
         try:
             plan = self._read_plan()
             allow_deletions = plan["automation"].get("allow_deletions", False)
-            if (any(pair["mode"] in ("mirror", "two_way") for pair in plan["pairs"])
+            if (any(pair["mode"] in ("mirror", "move", "two_way") for pair in plan["pairs"])
                     and not allow_deletions):
                 allow_deletions = self.view.confirm(
-                    "This action includes a mode that can remove files. Mirror removes destination extras; "
-                    "two-way sync propagates deletions from either side.\n\n"
-                    "Authorize automatic deletions for this action?",
-                    "Authorize automatic deletions",
+                    "This action includes a mode that removes files. Mirror removes destination extras, "
+                    "Move removes transferred files from the source, and Two-Way propagates deletions "
+                    "from either side.\n\nAuthorize automatic removals for this action?",
+                    "Authorize automatic removals",
                 )
                 if not allow_deletions:
                     return
@@ -437,7 +452,7 @@ class SyncEngineController(QtCore.QObject):
                     if self.worker is not None else "Confirmation received.",
                 )
                 if self.preview is not None and self.worker is None:
-                    self._execute_preview()
+                    self._maybe_execute_preview()
                 return
             self._automatic = False
             self._run_after_preview = False
@@ -468,7 +483,7 @@ class SyncEngineController(QtCore.QObject):
             self._countdown_active = False
             self._run_after_preview = True
             if self.preview is not None and self.worker is None:
-                self._execute_preview()
+                self._maybe_execute_preview()
             elif self.worker is not None:
                 self.view.set_status(
                     "Countdown finished. Sync will start as soon as the preview is ready."
@@ -513,7 +528,7 @@ class SyncEngineController(QtCore.QObject):
             self._transfer_started_at = None
             self._progress_data = {}
             self.view.set_busy(True)
-            self.view.begin_preview_generation()
+            self.view.begin_preview_generation(self.plan)
             self.view.set_status("Generating preview…")
             self.view.update_progress({"phase": "scan", "scanned_files": 0, "elapsed_seconds": 0})
             self._start_worker(BackupWorker(
@@ -545,8 +560,24 @@ class SyncEngineController(QtCore.QObject):
         worker.preview_ready.connect(self._receive_preview)
         worker.result_ready.connect(self._receive_result)
         worker.failed.connect(self._receive_error)
+        worker.source_removal_confirmation_requested.connect(self._confirm_source_removal)
         worker.finished.connect(self._worker_finished)
         worker.start()
+
+    @Slot(int)
+    def _confirm_source_removal(self, count):
+        """Asks before removing source files whose destination copies were verified."""
+        worker = self.worker
+        if worker is None:
+            return
+        approved = self.view.confirm(
+            f"Destination versions of {count} source files are present and verified. "
+            "Remove the original source files now? Choose No to keep them; other changes "
+            "approved at sync start will continue.",
+            "Confirm source file removal",
+        )
+        if self.worker is worker and worker.isRunning():
+            worker.resolve_source_removal_confirmation(approved)
 
     @Slot(object)
     def _receive_preview(self, preview):
@@ -639,7 +670,7 @@ class SyncEngineController(QtCore.QObject):
             if self._run_after_preview:
                 if self.plan.get("execution", {}).get("generate_report"):
                     self._write_sync_report({
-                        "status": "blocked_conflicts", "copied": 0, "deleted": 0,
+                        "status": "blocked_conflicts", "copied": 0, "moved": 0, "deleted": 0,
                         "bytes": 0, "errors": [], "warnings": [],
                     }, preview=preview)
                 self._run_after_preview = False
@@ -648,7 +679,22 @@ class SyncEngineController(QtCore.QObject):
         if canceled:
             self.view.set_status("Canceled before copying.", "warning")
         elif self._run_after_preview:
-            self._execute_preview()
+            self._maybe_execute_preview()
+
+    @Slot()
+    def _preview_render_finished(self):
+        """Continues a requested sync after both preview views have been drawn."""
+        self._maybe_execute_preview()
+
+    def _maybe_execute_preview(self):
+        """Waits for batched preview display work before starting execution."""
+        if not self._run_after_preview or self.preview is None or self.worker is not None:
+            return
+        if self.view.is_preview_rendering():
+            self.view.set_status("Preparing preview display. Sync will start when it is ready.")
+            return
+        self._run_after_preview = False
+        self._execute_preview()
 
     def _execute_preview(self):
         """Authorize destructive changes, then start backup execution."""
@@ -666,7 +712,9 @@ class SyncEngineController(QtCore.QObject):
         timeout_seconds = self.plan.get("execution", {}).get("timeout_seconds", 0)
         if self._automatic and timeout_seconds:
             self._operation_deadline = time.monotonic() + timeout_seconds
-        has_deletions = bool(summary.get("delete", 0) or summary.get("rmdir", 0))
+        has_deletions = bool(
+            summary.get("delete", 0) or summary.get("rmdir", 0) or summary.get("move", 0)
+        )
         allow_delete = False
         if has_deletions:
             if self._automatic:
@@ -674,28 +722,44 @@ class SyncEngineController(QtCore.QObject):
                     "allow_deletions", self.plan["automation"].get("allow_mirror", False)
                 )
                 if not allow_delete:
-                    self.view.set_status("This automatic action has no deletion permission.", "error")
+                    self.view.set_status("This automatic action has no removal permission.", "error")
                     return
             else:
+                move_count = summary.get("move", 0)
+                source_removals = max(0, summary.get("delete_source", 0) - move_count)
+                removal_details = []
+                if move_count:
+                    removal_details.append(f"move {move_count} files from source to destination")
+                if source_removals:
+                    removal_details.append(f"permanently remove {source_removals} other source files")
+                if summary.get("delete_destination", 0):
+                    removal_details.append(
+                        f"permanently remove {summary['delete_destination']} destination files"
+                    )
+                if summary.get("rmdir", 0):
+                    removal_details.append(f"remove {summary['rmdir']} destination folders")
                 allow_delete = self.view.confirm(
-                    f"This sync will permanently remove {summary.get('delete', 0)} files "
-                    f"({summary.get('delete_source', 0)} from the source side, "
-                    f"{summary.get('delete_destination', 0)} from the backup side) and "
-                    f"{summary.get('rmdir', 0)} destination folders.\n\n"
+                    f"This sync will {'; '.join(removal_details)}.\n\n"
                     "Review the Preview tab before continuing. Proceed with this sync?",
-                    "Confirm file removals",
+                    "Confirm removals and moves",
                 )
                 if not allow_delete:
                     self.view.set_status("Sync canceled. Preview remains available.", "warning")
                     return
         self.state = "syncing"
         self._transfer_started_at = None
-        self.view.set_busy(True)
+        self.view.set_busy(True, syncing=True)
         self.view.set_status("Synchronizing...")
         self.view.append_log(f"Started '{self.plan['name']}'.")
         self._start_worker(BackupWorker(
             self.plan, self.store.directory, preview=self.preview,
-            allow_delete=allow_delete, deadline=self._operation_deadline, parent=self,
+            allow_delete=allow_delete, deadline=self._operation_deadline,
+            source_removal_confirmation=(
+                not self._automatic and not self.plan.get("execution", {}).get(
+                    "skip_source_removal_confirmation", False
+                )
+            ),
+            parent=self,
         ))
         if self.plan.get("execution", {}).get("expand_log_while_syncing"):
             self.view.set_run_log_expanded(True)
@@ -707,7 +771,10 @@ class SyncEngineController(QtCore.QObject):
         Args:
             data (dict): Engine progress values.
         """
-        self._progress_data.update(data)
+        progress_data = dict(data)
+        completed_messages = progress_data.pop("completed_messages", [])
+        completed_items = progress_data.pop("completed_items", [])
+        self._progress_data.update(progress_data)
         progress = dict(self._progress_data)
         if progress.get("phase") == "scan" and self.state == "scanning":
             pair_id = str(progress.get("pair_id", ""))
@@ -737,6 +804,8 @@ class SyncEngineController(QtCore.QObject):
             remaining = max(0, progress.get("total_bytes", 0) - progress.get("completed_bytes", 0))
             progress["eta_seconds"] = remaining / speed if speed else None
         self.view.update_progress(progress)
+        if completed_items:
+            self.view.mark_preview_operations_complete(completed_items)
         if progress.get("phase") == "scan" and self.state == "scanning":
             status = f"Generating preview · {progress.get('scanned_entries', 0):,} items scanned"
             if self._countdown_active:
@@ -744,8 +813,11 @@ class SyncEngineController(QtCore.QObject):
                 status += f" · Sync starts in {remaining:,}s"
             self.view.set_status(status)
         message = progress.get("message")
-        if (progress.get("phase") in ("copy", "delete") and message
-                and message != self._last_live_log_message):
+        if completed_messages:
+            self.view.append_log("\n".join(str(item) for item in completed_messages))
+            self._last_live_log_message = message or str(completed_messages[-1])
+        elif (progress.get("phase") in ("copy", "delete") and message
+              and message != self._last_live_log_message):
             self._last_live_log_message = message
             self.view.append_log(message)
 
@@ -766,7 +838,7 @@ class SyncEngineController(QtCore.QObject):
         display_status = "Timed out" if status == "timed_out" else status.capitalize()
         message = (
             f"{display_status}: {result.get('copied', 0)} copied, "
-            f"{result.get('deleted', 0)} removed."
+            f"{result.get('moved', 0)} moved, {result.get('deleted', 0)} removed."
         )
         level = {"succeeded": "success", "cancelled": "warning"}.get(status, "error")
         self.view.set_status(message, level)
@@ -803,6 +875,7 @@ class SyncEngineController(QtCore.QObject):
             self._run_after_preview = False
             if self.worker is not None:
                 self.worker.cancel()
+                self.view.set_cancel_pending()
                 self.view.set_status("Stopping preview. Automatic sync canceled.", "warning")
             else:
                 self.state = "idle"
@@ -819,7 +892,31 @@ class SyncEngineController(QtCore.QObject):
                 QtCore.QTimer.singleShot(500, partial(QtWidgets.QApplication.exit, 3))
         elif self.worker is not None:
             self.worker.cancel()
-            self.view.set_status("Stopping safely...", "warning")
+            self.view.set_cancel_pending()
+            if self.state == "syncing":
+                self.view.set_status(
+                    "Stopping sync at the next safe point. An unfinished file is discarded; "
+                    "completed changes are retained.",
+                    "warning",
+                )
+            else:
+                self.view.set_status("Stopping preview...", "warning")
+
+    @Slot()
+    def _toggle_pause(self):
+        """Pauses or resumes an active sync at its next safe checkpoint."""
+        if self.state != "syncing" or self.worker is None:
+            return
+        if self.worker.cancel_event.is_set():
+            return
+        if self.worker.is_paused:
+            self.worker.resume()
+            self.view.set_paused(False)
+            self.view.set_status("Sync resumed.", "success")
+        else:
+            self.worker.pause()
+            self.view.set_paused(True)
+            self.view.set_status("Pausing at the next safe point.", "warning")
 
     def _show_failure(self, error):
         """Show concise status feedback and retain a detailed session log.
@@ -1043,10 +1140,11 @@ class SyncEngineController(QtCore.QObject):
         preview_form = QtWidgets.QFormLayout(preview_group)
         show_full_path = QtWidgets.QCheckBox("Show the full target-folder path")
         path_depth = QtWidgets.QSpinBox()
+        path_depth.setObjectName("targetPathDepthSpinBox")
         path_depth.setRange(1, 99)
-        path_depth.setSuffix(" folders")
+        path_depth.setSuffix(" levels")
         path_depth.setToolTip(
-            "When the full path is off, show this many trailing folder names in each tree root."
+            "When the full path is off, show this many trailing levels of the target path in each tree root."
         )
         preferences = self.store.read_preferences()
         show_full_path.setChecked(bool(preferences.get("preview_show_full_target_path", False)))
@@ -1057,7 +1155,7 @@ class SyncEngineController(QtCore.QObject):
         path_depth.setEnabled(not show_full_path.isChecked())
         show_full_path.toggled.connect(lambda checked: path_depth.setEnabled(not checked))
         preview_form.addRow("Target Path", show_full_path)
-        preview_form.addRow("Maximum Folders to Show", path_depth)
+        preview_form.addRow("Trailing Target Path Levels", path_depth)
         layout.addWidget(preview_group)
 
         buttons = QtWidgets.QDialogButtonBox(

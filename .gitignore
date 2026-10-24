@@ -11,3 +11,12 @@ data/
 /scripts/build/
 /.runtime/
 /scripts/dist/
+
+# Local agent tooling and instructions
+.serena/
+/AGENTS.md
+/CLAUDE.md
+
+# Local Windows launch helpers
+run*.bat
+run*.cmd
