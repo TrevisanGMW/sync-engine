@@ -18,6 +18,7 @@ from sync_engine_rclone import (
     RcloneError, executable_path, is_rclone_path,
     launch_config_wizard, parse_rclone_path, setup_status,
 )
+from sync_engine_rclone_export import build_rclone_batch, save_rclone_batch
 from sync_engine_rclone_view import RcloneFolderDialog
 from sync_engine_rclone_worker import RcloneDownloadWorker
 from sync_engine_style import padded_icon
@@ -123,7 +124,7 @@ class SyncEngineController(QtCore.QObject):
             self.plan_file_path = str(store.plans_directory / f"{self.plan['id']}.syncplan")
         self.view.set_plans(store.list_plans(), self.plan["id"])
         self.view.set_plan(self.plan)
-        self._refresh_google_drive_status()
+        self._refresh_rclone_status()
         self._close_after_automatic = bool(
             self.plan.get("automation", {}).get("close_after_run", False)
         )
@@ -163,6 +164,7 @@ class SyncEngineController(QtCore.QObject):
             "import_requested": self._import_plan,
             "export_requested": self._export_plan,
             "export_action_requested": self._export_action,
+            "export_rclone_batch_requested": self._export_rclone_batch,
             "preview_requested": self._request_preview,
             "sync_requested": self._request_sync,
             "cancel_requested": self.cancel,
@@ -180,13 +182,24 @@ class SyncEngineController(QtCore.QObject):
             "path_feedback_requested": self._inspect_path,
             "conflict_resolution_requested": self._resolve_conflict,
             "preview_view_changed": self._preview_view_changed,
-            "google_drive_setup_requested": self._setup_google_drive,
+            "rclone_setup_requested": self._setup_rclone,
+            "google_drive_setup_requested": self._setup_rclone,
             "google_drive_folder_requested": self._browse_google_drive,
             "closing": self._closing,
         }
         for signal_name, callback in connections.items():
             getattr(self.view, signal_name).connect(callback)
+        self.view.settings_tabs.currentChanged.connect(self._settings_tab_changed)
         self.view.preview_render_finished.connect(self._preview_render_finished)
+
+    def _settings_tab_changed(self, unused_index):
+        """Refreshes external rclone configuration when Options is opened.
+
+        Args:
+            unused_index (int): Newly selected settings tab index.
+        """
+        if self.view.settings_tabs.currentWidget() is self.view.options_page:
+            self._refresh_rclone_status()
 
     def _refresh_plans(self):
         """Refresh the sidebar while retaining the current plan selection."""
@@ -426,6 +439,47 @@ class SyncEngineController(QtCore.QObject):
             if path:
                 save_action(plan, path, allow_deletions=allow_deletions)
                 self.view.set_status(f"Automatic action exported: {path}", "success")
+        except Exception as error:
+            self._show_failure(error)
+
+    @Slot()
+    def _export_rclone_batch(self):
+        """Exports the current plan as a standalone rclone batch file."""
+        try:
+            plan = self._read_plan()
+            resolved_plan = resolve_plan_paths(plan, file_path=self.plan_file_path)
+            status = setup_status()
+            batch_contents = build_rclone_batch(
+                resolved_plan,
+                status.get("executable"),
+                status.get("config_path"),
+                status.get("remotes", []),
+                allow_deletions=True,
+            )
+            deletion_modes = [
+                pair["mode"] for pair in plan["pairs"]
+                if pair["mode"] in ("mirror", "move")
+            ]
+            if deletion_modes and not plan["automation"].get("allow_deletions", False):
+                message = (
+                    "The exported BAT will run without SyncEngine's later confirmation prompts. "
+                    "Mirror removes destination-only files inside each selected destination folder; "
+                    "Move removes transferred files from the selected source folder. "
+                    "Authorize these automatic removals in the generated BAT?"
+                )
+                if not self.view.confirm(message, "Authorize rclone BAT removals"):
+                    self.view.set_status("rclone BAT export cancelled; no file was created.", "warning")
+                    return
+            path = self._choose_export(
+                "Export rclone batch file", ".bat", plan.get("name", "")
+            )
+            if path:
+                save_rclone_batch(batch_contents, path)
+                self.view.set_status(f"rclone BAT exported: {path}", "success")
+        except ValueError as error:
+            self.view.set_status(str(error), "warning")
+            self.view.append_log(f"rclone BAT export skipped: {error}")
+            logger.warning("rclone BAT export skipped: %s", error)
         except Exception as error:
             self._show_failure(error)
 
@@ -1028,7 +1082,7 @@ class SyncEngineController(QtCore.QObject):
                 ])
                 self.view.set_status(
                     "Google Drive remote is configured; Preview will check access." if configured
-                    else "Google Drive setup is incomplete. Use Options to configure it.",
+                    else "rclone setup is incomplete. Use Options to configure rclone.",
                     "success" if configured else "warning",
                 )
                 self.view.append_log(
@@ -1079,10 +1133,11 @@ class SyncEngineController(QtCore.QObject):
         status = setup_status()
         if status["executable"] is None:
             return (
-                "This plan uses Google Drive, but rclone is not set up. Open Options and choose "
-                "Set Up Google Drive before previewing or syncing."
+                "This plan uses an rclone destination, but rclone is not installed. Open Options and choose "
+                "Set Up rclone before previewing or syncing."
             )
-        configured = set(status["drive_remotes"])
+        configured = set(status.get("remotes", []))
+        drive_remotes = set(status["drive_remotes"])
         for destination in destinations:
             try:
                 remote_name, unused_folder = parse_rclone_path(destination)
@@ -1090,20 +1145,26 @@ class SyncEngineController(QtCore.QObject):
                 return str(error)
             if remote_name not in configured:
                 return (
-                    f"This plan uses the Google Drive remote '{remote_name}', which is not configured. "
-                    "Open Options and finish Google Drive setup before previewing or syncing."
+                    f"This plan uses the rclone remote '{remote_name}', which is not configured. "
+                    "Open Options and configure it in rclone before previewing or syncing."
+                )
+            if remote_name not in drive_remotes:
+                return (
+                    f"The rclone remote '{remote_name}' is configured, but SyncEngine's in-app "
+                    "sync currently supports Google Drive destinations. Export an rclone BAT "
+                    "from Automation to use another backend."
                 )
         return ""
 
     @Slot()
-    def _setup_google_drive(self):
-        """Downloads rclone on demand, then opens its OAuth configuration wizard."""
+    def _setup_rclone(self):
+        """Downloads rclone when needed, then opens its remote configuration wizard."""
         if self.rclone_setup_worker is not None:
             return
         if executable_path() is None:
             self._rclone_downloaded_path = None
             self._rclone_download_error = None
-            self.view.set_google_drive_setup_status(
+            self.view.set_rclone_setup_status(
                 "Downloading the optional rclone executable and verifying its checksum...",
                 "Downloading...", enabled=False,
             )
@@ -1120,7 +1181,7 @@ class SyncEngineController(QtCore.QObject):
     @Slot(str)
     def _rclone_download_progress(self, message):
         """Shows rclone download progress in Options."""
-        self.view.set_google_drive_setup_status(str(message), "Downloading...", enabled=False)
+        self.view.set_rclone_setup_status(str(message), "Downloading...", enabled=False)
 
     @Slot(str)
     def _rclone_download_installed(self, path):
@@ -1146,14 +1207,14 @@ class SyncEngineController(QtCore.QObject):
             message = self._rclone_download_error
             self._rclone_download_error = None
             self._rclone_downloaded_path = None
-            self._refresh_google_drive_status()
-            self.view.set_google_drive_setup_status(
-                message, "Retry Google Drive Setup...", enabled=True,
+            self._refresh_rclone_status()
+            self.view.set_rclone_setup_status(
+                message, "Retry rclone setup...", enabled=True,
             )
             self.view.set_status(message, "error")
             self.view.append_log(f"Rclone setup failed: {message}")
             return
-        self._refresh_google_drive_status()
+        self._refresh_rclone_status()
         if self._rclone_downloaded_path:
             self._rclone_downloaded_path = None
             self._launch_rclone_configuration()
@@ -1163,65 +1224,73 @@ class SyncEngineController(QtCore.QObject):
         try:
             self._rclone_config_process = launch_config_wizard()
         except RcloneError as error:
-            self.view.set_google_drive_setup_status(
-                str(error), "Configure Google Drive...", enabled=True,
+            self.view.set_rclone_setup_status(
+                str(error), "Configure rclone...", enabled=True,
             )
             self.view.set_status(str(error), "error")
             self.view.append_log(f"Could not open rclone configuration: {error}")
             return
         self._rclone_config_poll_count = 0
-        self.view.set_google_drive_setup_status(
-            "Finish setup in the rclone terminal. Create a remote with type 'drive', then return here.",
-            "Waiting for setup...", enabled=False,
+        self.view.set_rclone_setup_status(
+            "Add or edit a remote in the rclone terminal, then close it to refresh this status.",
+            "Waiting for rclone...", enabled=False,
         )
-        self.view.set_status("Complete Google Drive authorization in the rclone terminal.")
+        self.view.set_status("Complete rclone configuration in the terminal.")
         self.rclone_status_timer.start()
 
-    def _refresh_google_drive_status(self):
-        """Shows whether the private rclone download and Drive remote are ready."""
+    def _refresh_rclone_status(self):
+        """Shows whether rclone and any configured remotes are available."""
         status = setup_status()
+        remote_names = status.get("remotes", [])
+        integration_note = "SyncEngine's destination integration currently supports Google Drive."
         if status["executable"] is None:
-            self.view.set_google_drive_setup_status(
-                "Optional. SyncEngine downloads rclone from downloads.rclone.org only when requested.",
-                "Set Up Google Drive...", enabled=True,
+            message = (
+                "Optional. SyncEngine downloads rclone only when requested. "
+                "Configure any backend supported by rclone. "
+                f"{integration_note}"
             )
-        elif status["drive_remotes"]:
-            names = ", ".join(status["drive_remotes"])
-            self.view.set_google_drive_setup_status(
-                f"Configured. Google Drive remote(s): {names}",
-                "Manage remotes...", enabled=True,
+            self.view.set_rclone_setup_status(
+                message,
+                "Set Up rclone...", enabled=True,
+            )
+        elif remote_names:
+            names = ", ".join(remote_names)
+            self.view.set_rclone_setup_status(
+                f"Configured rclone remote(s): {names}. {integration_note}",
+                "Edit rclone Config...", enabled=True,
             )
         else:
-            self.view.set_google_drive_setup_status(
-                "Rclone is installed. Configure a remote with the Google Drive backend type 'drive'.",
-                "Configure Google Drive...", enabled=True,
+            message = (
+                "Rclone is installed. Configure any backend supported by rclone. "
+                f"{integration_note}"
+            )
+            self.view.set_rclone_setup_status(
+                message,
+                "Configure rclone...", enabled=True,
             )
 
     @Slot()
     def _poll_rclone_setup(self):
-        """Refreshes status while the user completes rclone OAuth setup."""
+        """Refreshes status after the user closes the rclone configuration wizard."""
         self._rclone_config_poll_count += 1
-        status = setup_status()
-        if status["drive_remotes"]:
-            self.rclone_status_timer.stop()
-            self._rclone_config_process = None
-            self._refresh_google_drive_status()
-            self.view.set_status("Google Drive setup is ready.", "success")
-            return
         if (self._rclone_config_process is not None
                 and self._rclone_config_process.poll() is not None):
             self.rclone_status_timer.stop()
             self._rclone_config_process = None
-            self._refresh_google_drive_status()
-            self.view.set_status(
-                "No Google Drive remote was saved. Use Options to configure it and try again.",
-                "warning",
-            )
+            status = setup_status()
+            self._refresh_rclone_status()
+            if status.get("remotes"):
+                self.view.set_status("rclone configuration is ready.", "success")
+            else:
+                self.view.set_status("No rclone remotes were saved.", "warning")
             return
         if self._rclone_config_poll_count >= 1200:
             self.rclone_status_timer.stop()
-            self._rclone_config_process = None
-            self._refresh_google_drive_status()
+            self._refresh_rclone_status()
+
+    def _refresh_google_drive_status(self):
+        """Keeps the legacy status refresh method available to older callers."""
+        self._refresh_rclone_status()
 
     @Slot()
     def _browse_google_drive(self):
@@ -1451,7 +1520,7 @@ class SyncEngineController(QtCore.QObject):
             event.ignore()
             self._close_pending = True
             self.rclone_setup_worker.cancel()
-            self.view.set_google_drive_setup_status(
+            self.view.set_rclone_setup_status(
                 "Stopping the rclone download before closing...", "Stopping...", enabled=False,
             )
             return

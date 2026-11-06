@@ -249,7 +249,10 @@ def _prepare_pairs(plan):
                 normalized[f"canonical_{path_key}"] = rclone.canonical_rclone_path(raw_path)
                 continue
             if path_key == "source" and rclone.is_rclone_path(raw_path):
-                raise SyncError("Google Drive can be used as a destination; source folders must be local.")
+                raise SyncError(
+                    "SyncEngine preview and sync require local source folders. "
+                    "Rclone source paths are supported by exported rclone BAT files."
+                )
             if not os.path.isabs(raw_path):
                 raise SyncError(f"The {path_key} path must be absolute: {raw_path}")
             normalized[path_key] = os.path.abspath(raw_path)

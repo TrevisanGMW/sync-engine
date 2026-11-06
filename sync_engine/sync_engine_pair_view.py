@@ -167,9 +167,17 @@ class FolderPairEditor(QtWidgets.QWidget):
         variable_tip = (
             "Supports {variable} path tokens defined in the Variables tab, plus built-in path variables."
         )
-        self.source_path.setToolTip(variable_tip)
+        self.source_path.setToolTip(
+            f"{variable_tip}\nFor an rclone BAT export, enter a remote path as "
+            "rclone://remote-name/folder/path below the remote root, for example "
+            "rclone://gdrive/Backup/archive. The remote must be configured in Options > rclone. "
+            "Rclone source paths are supported by BAT exports; SyncEngine preview and sync "
+            "currently require a local source."
+        )
         self.destination_path.setToolTip(
-            f"{variable_tip} Use the folder button menu to choose a local folder or Google Drive."
+            f"{variable_tip}\nUse the folder button menu for a local folder or Google Drive. "
+            "For an rclone BAT export, enter rclone://remote-name/folder/path below the remote root, "
+            "for example rclone://gdrive/Backup/archive. The remote must be configured in Options > rclone."
         )
         paths.addRow("Source", self._path_row(self.source_path, self._browse_source, "Source"))
         paths.addRow(

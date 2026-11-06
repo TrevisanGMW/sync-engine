@@ -549,7 +549,7 @@ def _resolve_paths(plan, file_path):
         file_path (str or pathlib.Path): File from which the plan was loaded.
 
     Returns:
-        dict: Plan with resolved folder paths.
+        dict: Plan with resolved local paths and rclone URIs.
     """
     parent = Path(file_path).absolute().parent
     for pair in plan["pairs"]:
@@ -557,7 +557,7 @@ def _resolve_paths(plan, file_path):
             value = pair[field]
             if not value:
                 continue
-            if field == "destination" and is_rclone_path(value):
+            if is_rclone_path(value):
                 pair[field] = value.strip()
                 continue
             if _ENVIRONMENT_VARIABLE_PATTERN.search(value):
@@ -583,7 +583,7 @@ def resolve_plan_paths(plan, file_path=None):
             .syncrun path, used by the sync-file variables and relative paths.
 
     Returns:
-        dict: Independent copy with absolute source and destination paths.
+        dict: Independent copy with absolute local paths or normalized rclone URIs.
 
     Raises:
         ValueError: If a variable is unknown or cyclic, or a path is invalid.
@@ -660,7 +660,7 @@ def resolve_plan_paths(plan, file_path=None):
             if not value:
                 continue
             expanded = os.path.expandvars(os.path.expanduser(expand_text(value)))
-            if field == "destination" and is_rclone_path(expanded):
+            if is_rclone_path(expanded):
                 pair[field] = expanded.strip()
                 continue
             folder = Path(expanded)
@@ -709,7 +709,7 @@ def resolve_path_template(plan, path_template, file_path=None, field=None):
         field (str, optional): Path field being inspected, either ``source`` or ``destination``.
 
     Returns:
-        str: Expanded absolute local path or normalized Google Drive destination URI.
+        str: Expanded absolute local path or normalized rclone remote URI.
 
     Raises:
         ValueError: If the template is empty, contains an unknown variable, or

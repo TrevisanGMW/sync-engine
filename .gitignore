@@ -20,3 +20,4 @@ data/
 # Local Windows launch helpers
 run*.bat
 run*.cmd
+run_sync*.bat

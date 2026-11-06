@@ -1,4 +1,4 @@
-"""Private rclone setup and Google Drive access for SyncEngine."""
+"""Private rclone setup and Google Drive operations for SyncEngine."""
 
 import configparser
 import hashlib
@@ -26,7 +26,7 @@ RCLONE_PATH_PATTERN = re.compile(r"^rclone://([^/]+)/?(.*)$", re.IGNORECASE)
 
 
 class RcloneError(RuntimeError):
-    """Raised when rclone setup or a Google Drive operation fails."""
+    """Raised when rclone setup or an rclone-backed operation fails."""
 
 
 class RcloneCancelled(Exception):
@@ -34,19 +34,19 @@ class RcloneCancelled(Exception):
 
 
 def is_rclone_path(path):
-    """Checks whether a destination uses SyncEngine's Google Drive path form.
+    """Checks whether a path uses SyncEngine's rclone remote URI form.
 
     Args:
-        path (str): Candidate destination path.
+        path (str): Candidate local or rclone path.
 
     Returns:
-        bool: Whether the path begins with the rclone destination prefix.
+        bool: Whether the path begins with the rclone URI prefix.
     """
     return isinstance(path, str) and bool(RCLONE_PATH_PATTERN.match(path.strip()))
 
 
 def parse_rclone_path(path):
-    """Splits a SyncEngine Google Drive destination into remote and folder.
+    """Splits a SyncEngine rclone URI into remote and folder.
 
     Args:
         path (str): Path in the ``rclone://remote/folder`` form.
@@ -55,25 +55,25 @@ def parse_rclone_path(path):
         tuple[str, str]: Remote name and slash-separated folder path.
 
     Raises:
-        ValueError: If the destination is malformed or contains an unsafe path.
+        ValueError: If the path is malformed or contains an unsafe component.
     """
     match = RCLONE_PATH_PATTERN.match(str(path or "").strip())
     if not match:
-        raise ValueError("Google Drive destinations must use rclone://remote/folder paths.")
+        raise ValueError("Rclone paths must use the rclone://remote/folder form.")
     remote_name = match.group(1).strip()
     folder_path = match.group(2).replace("\\", "/").strip("/")
     if not remote_name or ":" in remote_name:
-        raise ValueError("The Google Drive remote name is invalid.")
+        raise ValueError("The rclone remote name is invalid.")
     if any(part in (".", "..") for part in folder_path.split("/")):
-        raise ValueError("Google Drive folder paths cannot contain '.' or '..' components.")
+        raise ValueError("Rclone folder paths cannot contain '.' or '..' components.")
     return remote_name, folder_path
 
 
 def make_rclone_path(remote_name, folder_path):
-    """Formats a remote and folder path for SyncEngine plan storage.
+    """Formats an rclone remote and folder path for SyncEngine plan storage.
 
     Args:
-        remote_name (str): Name of a configured rclone Drive remote.
+        remote_name (str): Name of a configured rclone remote.
         folder_path (str): Folder path relative to the remote root.
 
     Returns:
@@ -85,20 +85,20 @@ def make_rclone_path(remote_name, folder_path):
     remote_name = str(remote_name or "").strip()
     folder_path = str(folder_path or "").replace("\\", "/").strip("/")
     if not remote_name or ":" in remote_name or "/" in remote_name:
-        raise ValueError("The Google Drive remote name is invalid.")
+        raise ValueError("The rclone remote name is invalid.")
     if any(part in (".", "..") for part in folder_path.split("/")):
-        raise ValueError("Google Drive folder paths cannot contain '.' or '..' components.")
+        raise ValueError("Rclone folder paths cannot contain '.' or '..' components.")
     return f"rclone://{remote_name}/{folder_path}" if folder_path else f"rclone://{remote_name}/"
 
 
 def rclone_remote_path(path):
-    """Converts a SyncEngine path to rclone's ``remote:path`` syntax.
+    """Converts a SyncEngine rclone URI to rclone's ``remote:path`` syntax.
 
     Args:
-        path (str): SyncEngine Google Drive path.
+        path (str): SyncEngine rclone URI.
 
     Returns:
-        str: rclone remote path.
+        str: Native rclone remote path.
     """
     remote_name, folder_path = parse_rclone_path(path)
     return f"{remote_name}:{folder_path}"
@@ -197,24 +197,26 @@ def _read_installed_version():
 
 
 def executable_path():
-    """Returns the private rclone executable path, when it has been installed.
+    """Returns the managed or manually placed rclone executable, when available.
 
     Returns:
-        pathlib.Path or None: Installed executable path when available.
+        pathlib.Path or None: Executable path when available.
     """
     extension = ".exe" if os.name == "nt" else ""
     version = _read_installed_version()
-    if not version:
-        return None
-    path = rclone_directory() / f"rclone-{version}{extension}"
-    return path if path.is_file() else None
+    if version:
+        versioned_path = rclone_directory() / f"rclone-{version}{extension}"
+        if versioned_path.is_file():
+            return versioned_path
+    manual_path = rclone_directory() / f"rclone{extension}"
+    return manual_path if manual_path.is_file() else None
 
 
-def configured_drive_remotes():
-    """Lists configured remotes whose backend is Google Drive.
+def _configured_remote_types():
+    """Reads configured rclone remote names and backend types.
 
     Returns:
-        list[str]: Google Drive remote names in the private config file.
+        list[tuple[str, str]]: Remote name and backend type pairs.
     """
     path = config_path()
     if not path.is_file():
@@ -226,23 +228,46 @@ def configured_drive_remotes():
         parser.read(str(path), encoding="utf-8")
     except (OSError, UnicodeError, configparser.Error):
         return []
-    remote_names = [
-        section for section in parser.sections()
-        if parser.get(section, "type", fallback="").strip().casefold() == "drive"
+    remote_types = []
+    for section in parser.sections():
+        backend = parser.get(section, "type", fallback="").strip()
+        if backend:
+            remote_types.append((section, backend))
+    return sorted(remote_types, key=lambda remote: remote[0].casefold())
+
+
+def configured_remotes():
+    """Lists all configured rclone remotes, regardless of backend.
+
+    Returns:
+        list[str]: Configured remote names in the private config file.
+    """
+    return [name for name, unused_backend in _configured_remote_types()]
+
+
+def configured_drive_remotes():
+    """Lists configured remotes whose backend is Google Drive.
+
+    Returns:
+        list[str]: Google Drive remote names in the private config file.
+    """
+    return [
+        name for name, backend in _configured_remote_types()
+        if backend.casefold() == "drive"
     ]
-    return sorted(remote_names, key=str.casefold)
 
 
 def setup_status():
     """Returns a non-sensitive summary of the private rclone setup state.
 
     Returns:
-        dict: Installed binary path, version, and configured Drive remotes.
+        dict: Installed binary path, version, and configured remotes.
     """
     return {
         "executable": executable_path(),
         "version": _read_installed_version(),
         "config_path": config_path(),
+        "remotes": configured_remotes(),
         "drive_remotes": configured_drive_remotes(),
     }
 
@@ -263,13 +288,13 @@ def ensure_drive_remote(path):
     executable = executable_path()
     if executable is None:
         raise RcloneError(
-            "Google Drive is not set up. Open Options and choose Set Up Google Drive to download rclone."
+            "rclone is not installed. Open Options and choose Set Up rclone to download it."
         )
     config = config_path()
     if remote_name not in configured_drive_remotes():
         raise RcloneError(
             f"The Google Drive remote '{remote_name}' is not configured. Open Options and finish "
-            "Google Drive setup, then choose the destination folder again."
+            "rclone setup with a Google Drive remote, then choose the destination folder again."
         )
     _set_private_permissions(config)
     return executable, config
@@ -488,7 +513,7 @@ def command_prefix(path=None):
     executable = Path(path) if path else executable_path()
     if executable is None or not executable.is_file():
         raise RcloneError(
-            "Rclone is not installed. Open Options and choose Set Up Google Drive to download it."
+            "Rclone is not installed. Open Options and choose Set Up rclone to download it."
         )
     return [str(executable), "--config", str(config_path())]
 
@@ -972,7 +997,7 @@ def remove_remote_directory(path, cancel_event=None, progress_callback=None):
 
 
 def launch_config_wizard():
-    """Opens rclone config in a visible terminal for Google OAuth authorization.
+    """Opens rclone config in a visible terminal for remote setup.
 
     Returns:
         subprocess.Popen or None: Process on Windows, where SyncEngine can watch it.

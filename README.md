@@ -52,11 +52,15 @@ The GUI launcher creates its private Qt runtime automatically when needed. The f
 6. Choose **Sync**. SyncEngine checks the plan again before it writes files and asks before planned removals.
 7. Save the plan to keep edits, or export a `.syncplan` file to share it.
 
-## Google Drive destinations
+## rclone setup and Google Drive destinations
 
-SyncEngine can use rclone for Google Drive destinations without bundling rclone or adding a Python dependency. Open **Options > Google Drive** and choose **Set Up Google Drive**. SyncEngine downloads the current official rclone build only after that request, checks its SHA-256 against rclone's versioned checksum manifest, and stores the executable and rclone configuration under the app's `data/integrations/rclone/` folder.
+Generated rclone BAT files write rclone issues and the final result to one .log file.
 
-After the download, an rclone terminal opens. Create a new remote, give it a short name such as `gdrive`, choose the Google Drive backend (`drive`), and complete Google's browser authorization. Leave rclone's config password unset so scheduled and headless runs can use the saved OAuth token. Return to SyncEngine after setup; the Options status updates when the Drive remote is configured.
+SyncEngine can download and configure rclone without bundling it or adding a Python dependency. Open **Options > rclone** and choose **Set Up rclone**. SyncEngine downloads the current official rclone build only after that request, checks its SHA-256 against rclone's versioned checksum manifest, and stores the executable and rclone configuration under the app's `data/integrations/rclone/` folder. The rclone wizard lets you configure any backend supported by rclone. When a remote is configured, the Options button changes to **Edit rclone Config** and the status lists configured remotes.
+
+SyncEngine's destination browser and sync integration currently support Google Drive remotes. To use Google Drive, create a remote with a short name such as `gdrive`, choose the Google Drive backend (`drive`), and complete Google's browser authorization. Leave rclone's config password unset so scheduled and headless runs can use the saved OAuth token. Return to SyncEngine after setup; the Options status refreshes when the tab is opened.
+
+The **Automation** tab can export an **rclone BAT** for standalone or scheduled use. Each folder pair must use an rclone URI on its source or destination, such as `rclone://gdrive/Backup/archive`; the BAT captures resolved paths and supported exclusion rules when exported. It can use any remote configured in rclone. The in-app destination browser and sync engine remain Google Drive-specific. Two-way plans, content comparison, unsupported filter rules, and nonzero overall timeouts cannot be represented faithfully and are rejected during export.
 
 In **Folders**, use the small arrow beside the destination browse button and choose **Browse Google Drive**. Pick an existing folder below the Drive root. Local destination browsing and all existing local plans continue to work the same way. Google Drive folder paths are saved in the plan, while the OAuth token stays in the local rclone config and is not included in exported plans.
 

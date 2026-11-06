@@ -205,6 +205,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
     import_requested = QtCore.Signal()
     export_requested = QtCore.Signal()
     export_action_requested = QtCore.Signal()
+    export_rclone_batch_requested = QtCore.Signal()
     preview_requested = QtCore.Signal()
     sync_requested = QtCore.Signal()
     cancel_requested = QtCore.Signal()
@@ -215,6 +216,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
     automatic_runs_requested = QtCore.Signal()
     show_environment_variables_requested = QtCore.Signal()
     show_reports_requested = QtCore.Signal()
+    rclone_setup_requested = QtCore.Signal()
     google_drive_setup_requested = QtCore.Signal()
     google_drive_folder_requested = QtCore.Signal()
     plan_context_requested = QtCore.Signal(str, str)
@@ -624,18 +626,22 @@ class SyncEngineView(QtWidgets.QMainWindow):
         ))
         form.addRow("Timestamp Tolerance", self.timestamp_tolerance)
         layout.addWidget(comparison)
-        google_drive = QtWidgets.QGroupBox("Google Drive")
-        google_drive_layout = QtWidgets.QHBoxLayout(google_drive)
-        self.google_drive_setup_status = QtWidgets.QLabel()
-        self.google_drive_setup_status.setWordWrap(True)
-        self.google_drive_setup_status.setObjectName("mutedLabel")
-        google_drive_layout.addWidget(self.google_drive_setup_status, 1)
-        self.google_drive_setup_button = self._button(
-            "Set Up Google Drive...",
-            lambda checked=False: self.google_drive_setup_requested.emit(),
+        rclone_setup = QtWidgets.QGroupBox("rclone")
+        rclone_setup_layout = QtWidgets.QHBoxLayout(rclone_setup)
+        self.rclone_setup_status = QtWidgets.QLabel()
+        self.rclone_setup_status.setWordWrap(True)
+        self.rclone_setup_status.setObjectName("mutedLabel")
+        rclone_setup_layout.addWidget(self.rclone_setup_status, 1)
+        self.rclone_setup_button = self._button(
+            "Set Up rclone...",
+            lambda checked=False: self.rclone_setup_requested.emit(),
         )
-        google_drive_layout.addWidget(self.google_drive_setup_button)
-        layout.addWidget(google_drive)
+        rclone_setup_layout.addWidget(self.rclone_setup_button)
+        layout.addWidget(rclone_setup)
+
+        # Preserve the previous widget attributes for callers using the old names.
+        self.google_drive_setup_status = self.rclone_setup_status
+        self.google_drive_setup_button = self.rclone_setup_button
         preview_details = QtWidgets.QGroupBox("Preview Details")
         preview_details_layout = QtWidgets.QVBoxLayout(preview_details)
         self.list_skipped_folder_contents = QtWidgets.QCheckBox(
@@ -1026,6 +1032,18 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.export_action_button = self._button("Export Automatic Action…", self.export_action_requested.emit)
         self.export_action_button.setObjectName("primaryButton")
         buttons.addWidget(self.export_action_button)
+        self.export_rclone_batch_button = self._button(
+            "Export rclone BAT…", self.export_rclone_batch_requested.emit,
+        )
+        self.export_rclone_batch_button.setToolTip(multiline_tooltip(
+            "Exports this plan as a standalone rclone batch file. Every folder pair must use an "
+            "rclone path on its source or destination, written as rclone://remote-name/folder/path "
+            "below the remote root (for example, rclone://gdrive/Backup/archive). The remote must be configured in "
+            "Options > rclone. Paths and filters are captured when the BAT is exported. "
+            "The log contains issues and the final result. "
+            "SyncEngine's in-app sync integration currently supports Google Drive destinations."
+        ))
+        buttons.addWidget(self.export_rclone_batch_button)
         buttons.addStretch()
         layout.addLayout(buttons)
         layout.addStretch()
@@ -1482,11 +1500,15 @@ class SyncEngineView(QtWidgets.QMainWindow):
                 self.plans_list.setCurrentItem(item)
         self._loading = prior_loading
 
-    def set_google_drive_setup_status(self, message, button_text, enabled=True):
+    def set_rclone_setup_status(self, message, button_text, enabled=True):
         """Updates the compact rclone setup status in Options."""
-        self.google_drive_setup_status.setText(str(message))
-        self.google_drive_setup_button.setText(str(button_text))
-        self.google_drive_setup_button.setEnabled(bool(enabled))
+        self.rclone_setup_status.setText(str(message))
+        self.rclone_setup_button.setText(str(button_text))
+        self.rclone_setup_button.setEnabled(bool(enabled))
+
+    def set_google_drive_setup_status(self, message, button_text, enabled=True):
+        """Updates the rclone status through the legacy Google Drive method name."""
+        self.set_rclone_setup_status(message, button_text, enabled)
 
     def set_destination_path(self, path):
         """Places a selected local or Google Drive destination into the editor."""
@@ -1762,6 +1784,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.preview_button.setEnabled(editable)
         self.sync_button.setEnabled(editable)
         self.export_action_button.setEnabled(editable)
+        self.export_rclone_batch_button.setEnabled(editable)
         for index, action in enumerate(self._file_menu_actions):
             action.setEnabled(not self._busy and (index < 3 or has_plan))
         self.register_action.setEnabled(not self._busy)
