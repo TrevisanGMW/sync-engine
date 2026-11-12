@@ -80,6 +80,17 @@ Each query row has its own **Run** button, which is enabled when **Query** is ch
 
 Use **Tools > Preferences** to choose how much of each target path appears in the folder tree. The tree shows the final two path levels by default and adds an ellipsis when earlier levels are hidden; choose a different trailing path depth or show the full path.
 
+The title row includes a **Compact Mode** button. **File > Compact Mode** (Ctrl+Shift+M) opens the same small
+window with the current plan name, status icon, and progress bar. Use its expand button to return to the
+editor with your preview and window size preserved. A spinning green arc means work is running; a green
+check marks completion, an amber triangle indicates warnings, and a red icon indicates failure or cancellation.
+
+Under **Tools > Preferences > Window**, **Launch in compact mode** applies on the next launch.
+**Minimize to the system tray** is off by default. When enabled, minimizing either window hides it in the
+tray, where a percentage tile shows progress and the run's status color. Double-click the tile to restore
+the window, or right-click it to switch views, cancel the current run, or close SyncEngine. If the system
+tray is unavailable, minimizing uses the taskbar. Closing still saves edits and waits for active work to stop.
+
 Built-ins include `{plan-dir}` (the directory containing the active `.syncplan` or `.syncrun` file), `{plan-file}`, `{sync-file}`, `{plan-parent-dir}`, `{plan-name}`, `{plan-id}`, `{home-dir}`, `{desktop-dir}`, `{documents-dir}`, `{downloads-dir}`, `{temp-dir}`, `{user-name}`, `{hostname}`, `{date}`, `{year}`, `{month}`, `{day}`, and `{time}`. `{sync-file-dir}` and `{sync-file-parent}` are aliases for `{plan-dir}`. Operating-system environment variables are also available by name, such as `{USERPROFILE}` on Windows or `{HOME}` on macOS and Linux.
 
 For example, define `{backup-root}` as `E:/Backups`, then set a destination to `{backup-root}/Workbench/assets`. Variable templates remain in the saved plan and expand when the plan is previewed or run.

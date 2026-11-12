@@ -12,6 +12,8 @@ from sync_engine_style import (
 from sync_engine_widgets import PathLabel, format_bytes, format_duration
 from sync_engine_pair_view import FolderPairEditor
 from sync_engine_version import VERSION
+from sync_engine_monitor import WindowManager
+from sync_engine_window import native_event, prepare_native_window
 
 
 class _VariableNameDelegate(QtWidgets.QStyledItemDelegate):
@@ -287,6 +289,8 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.setMinimumSize(820, 660)
         self._build_menu()
         self._build_window()
+        self.window_manager = WindowManager(self)
+        self.compact_action.toggled.connect(self.window_manager.set_compact)
         self._connect_fields()
         self.set_plan(None)
         self.set_status("Create a sync plan or import an existing one.")
@@ -320,6 +324,11 @@ class SyncEngineView(QtWidgets.QMainWindow):
                 action.setShortcut(QtGui.QKeySequence(shortcut))
             self._file_menu_actions.append(action)
         file_menu.addSeparator()
+        self.compact_action = file_menu.addAction(
+            padded_icon("icons/window_compact.svg"), "Compact Mode"
+        )
+        self.compact_action.setCheckable(True)
+        self.compact_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+M"))
         self.close_action = file_menu.addAction(
             padded_icon("icons/close.svg"), "Close"
         )
@@ -485,13 +494,29 @@ class SyncEngineView(QtWidgets.QMainWindow):
     def resizeEvent(self, event):
         """Prioritizes action buttons over optional footer text at narrow widths."""
         super().resizeEvent(event)
+        if hasattr(self, "window_manager"):
+            self.window_manager.frame.refresh()
         if hasattr(self, "feedback_footer"):
             self._update_footer_visibility()
 
     def showEvent(self, event):
         """Refreshes status-bar layout after QMainWindow assigns its first geometry."""
         super().showEvent(event)
+        prepare_native_window(self)
         QtCore.QTimer.singleShot(0, self._refresh_footer_layout)
+
+    def nativeEvent(self, event_type, message):
+        """Preserves native Windows behavior beneath the application title row.
+
+        Args:
+            event_type (bytes): Qt platform event identifier.
+            message (object): Native message address.
+
+        Returns:
+            tuple: Native event disposition.
+        """
+        handled, result = native_event(event_type, message)
+        return (handled, result) if handled else super().nativeEvent(event_type, message)
 
     def _refresh_footer_layout(self):
         """Activates the footer layout after it receives its status-bar dimensions."""
@@ -1684,6 +1709,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
             syncing (bool): Whether the active operation is applying a sync.
         """
         self._busy = bool(busy)
+        self.window_manager.set_busy(self._busy)
         self._syncing = self._busy and bool(syncing)
         self._countdown_total = None
         self._refresh_enabled()
@@ -1802,6 +1828,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
         self.status_label.setText(str(text))
         self.status_label.setToolTip(str(text))
         self.status_label.setStyleSheet(f"color: {colors.get(level, colors['info'])};")
+        self.window_manager.note_message(text, level)
 
     def clear_preview(self):
         """Clears stale preview rows after settings or plan selection changes."""
@@ -2700,6 +2727,7 @@ class SyncEngineView(QtWidgets.QMainWindow):
         if not scanning:
             self.progress_bar.setFormat("%p%")
             self.progress_bar.setValue(max(0, min(1000, round(float(percent) * 10))))
+        self.window_manager.update_progress(percent, phase, warnings=data.get("warnings", False))
         if scanning:
             scanned_entries = data.get("scanned_entries", data.get("scanned_files", 0))
             self.operation_count.setText(f"{int(scanned_entries):,} items scanned")
@@ -2751,6 +2779,11 @@ class SyncEngineView(QtWidgets.QMainWindow):
             self.progress_bar.setFormat(f"Starts in {remaining:,}s")
             self.current_path.set_path("Cancel to stop this automatic action before it starts.")
             self.set_status("Automatic action is waiting. Cancel is available before and during the sync.")
+        phase = "scan" if preview_loading else "countdown"
+        progress = 0 if preview_loading else self.progress_bar.value() / 10.0
+        self.window_manager.update_progress(progress, phase)
+        if not preview_loading:
+            self.window_manager.compact_view.progress_bar.setFormat(f"Starts in {remaining:,}s")
 
     def reset_progress(self):
         """Resets transfer metrics before a new run begins."""
@@ -2991,4 +3024,5 @@ class SyncEngineView(QtWidgets.QMainWindow):
         """
         self.closing.emit(event)
         if event.isAccepted():
+            self.window_manager.shutdown()
             super().closeEvent(event)

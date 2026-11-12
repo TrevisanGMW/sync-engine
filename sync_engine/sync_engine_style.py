@@ -110,26 +110,22 @@ QTableWidget, QTreeWidget, QListWidget {
     selection-color: #ffffff;
 }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding: 5px; min-height: 21px; }
-QSpinBox#targetPathDepthSpinBox { padding: 3px 5px; min-height: 25px; }
+QSpinBox#targetPathDepthSpinBox { padding: 3px 27px 3px 5px; min-height: 25px; }
 QSpinBox#targetPathDepthSpinBox::up-button,
 QSpinBox#targetPathDepthSpinBox::down-button {
     subcontrol-origin: border; subcontrol-position: top right; width: 23px;
-    background: #405c6c; border-left: 1px solid #7894a4;
+    background: #404040; border-left: 1px solid #555555;
 }
 QSpinBox#targetPathDepthSpinBox::down-button {
-    subcontrol-position: bottom right; border-top: 1px solid #7894a4;
+    subcontrol-position: bottom right; border-top: 1px solid #555555;
 }
 QSpinBox#targetPathDepthSpinBox::up-button:hover,
-QSpinBox#targetPathDepthSpinBox::down-button:hover { background: #527f9a; }
+QSpinBox#targetPathDepthSpinBox::down-button:hover { background: #505050; }
 QSpinBox#targetPathDepthSpinBox::up-arrow {
-    width: 0px; height: 0px;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-bottom: 5px solid #f4f7f8;
+    image: url("@SPIN_UP@"); width: 10px; height: 6px;
 }
 QSpinBox#targetPathDepthSpinBox::down-arrow {
-    width: 0px; height: 0px;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 5px solid #f4f7f8;
+    image: url("@SPIN_DOWN@"); width: 10px; height: 6px;
 }
 QPlainTextEdit { padding: 5px; }
 QListWidget { padding: 4px; outline: none; }
@@ -187,4 +183,7 @@ QMenu { background: #353535; border: 1px solid #626262; }
 QMenu::item { padding: 6px 8px 6px 2px; }
 """
 
+DARK_STYLESHEET = DARK_STYLESHEET.replace(
+    "@SPIN_UP@", resource_path("icons/spin_up.svg").replace("\\", "/"),
+).replace("@SPIN_DOWN@", resource_path("icons/spin_down.svg").replace("\\", "/"))
 STYLESHEET = DARK_STYLESHEET

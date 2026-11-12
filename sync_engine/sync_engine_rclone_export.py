@@ -468,6 +468,20 @@ def build_rclone_batch(plan, rclone_executable, config_path, configured_remotes,
             f'echo Source: "%{source_name}%"',
             f'echo Destination: "%{destination_name}%"',
         ))
+        filter_flags = pair["filter_flag_lines"]
+        if filter_flags:
+            case_matching = (
+                "case-insensitive" if "--ignore-case" in filter_flags else "case-sensitive"
+            )
+            lines.extend((
+                "echo Filters: excluded entries are skipped.",
+                f"echo   Case matching: {case_matching}.",
+            ))
+            lines.extend(
+                f"echo   {flag}" for flag in filter_flags if flag != "--ignore-case"
+            )
+        else:
+            lines.append("echo Filters: none.")
     lines.extend((
         'echo Issues and final results will be logged to:',
         'echo "%LOG_FILE%"',

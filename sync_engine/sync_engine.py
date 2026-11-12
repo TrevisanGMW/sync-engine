@@ -96,10 +96,7 @@ def run_gui(options):
     minimized = automatic and not requires_confirmation and (
         options.minimized or controller.plan["automation"]["start_minimized"]
     )
-    if minimized:
-        view.showMinimized()
-    else:
-        view.show()
+    view.window_manager.show_initial(minimized=minimized)
     return application_exec(application)
 
 

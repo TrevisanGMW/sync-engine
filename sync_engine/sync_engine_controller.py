@@ -103,6 +103,8 @@ class SyncEngineController(QtCore.QObject):
         self.rclone_status_timer.timeout.connect(self._poll_rclone_setup)
         self._connect_actions()
         preferences = store.read_preferences()
+        self.view.window_manager.set_tray_enabled(preferences.get("minimize_to_tray", False))
+        self.view.window_manager.start_compact = bool(preferences.get("launch_in_compact_mode", False))
         self.view.set_preview_preferences(
             show_full_target_path=preferences.get("preview_show_full_target_path", False),
             path_depth=preferences.get("preview_target_path_depth", 2),
@@ -746,6 +748,7 @@ class SyncEngineController(QtCore.QObject):
         else:
             self.view.set_status("Preview ready. " + summary)
         if preview.get("summary", {}).get("conflict"):
+            self.view.window_manager.set_status("warning")
             self.view.set_status(
                 f"{preview['summary']['conflict']} two-way conflict(s) need a choice in the Preview tab.",
                 "warning",
@@ -761,8 +764,12 @@ class SyncEngineController(QtCore.QObject):
                 return
         if canceled:
             self.view.set_status("Canceled before copying.", "warning")
+            self.view.window_manager.set_status("cancelled")
         elif self._run_after_preview:
             self._maybe_execute_preview()
+        elif not self._countdown_active:
+            state = "warning" if preview.get("warnings") or preview.get("summary", {}).get("conflict") else "done"
+            self.view.window_manager.set_status(state, progress=100)
 
     @Slot()
     def _preview_render_finished(self):
@@ -934,6 +941,7 @@ class SyncEngineController(QtCore.QObject):
         final_progress = dict(self._progress_data)
         final_progress.update({
             "phase": status, "message": message,
+            "warnings": bool(result.get("warnings")),
             "elapsed_seconds": time.monotonic() - self._started_at,
         })
         if status == "succeeded":
@@ -1461,6 +1469,23 @@ class SyncEngineController(QtCore.QObject):
         preview_form.addRow("Trailing Target Path Levels", path_depth)
         layout.addWidget(preview_group)
 
+        window_group = QtWidgets.QGroupBox("Window")
+        window_layout = QtWidgets.QVBoxLayout(window_group)
+        launch_compact = QtWidgets.QCheckBox("Launch in compact mode")
+        launch_compact.setObjectName("launchCompactCheckBox")
+        launch_compact.setChecked(bool(preferences.get("launch_in_compact_mode", False)))
+        launch_compact.setToolTip("Open the small title row and progress bar on the next launch.")
+        minimize_to_tray = QtWidgets.QCheckBox("Minimize to the system tray")
+        minimize_to_tray.setObjectName("minimizeToTrayCheckBox")
+        minimize_to_tray.setChecked(bool(preferences.get("minimize_to_tray", False)))
+        minimize_to_tray.setToolTip(
+            "Show progress as a percentage in the tray. Double-click the icon to restore SyncEngine. "
+            "When no system tray is available, minimization uses the taskbar."
+        )
+        window_layout.addWidget(launch_compact)
+        window_layout.addWidget(minimize_to_tray)
+        layout.addWidget(window_group)
+
         buttons = QtWidgets.QDialogButtonBox(
             qt_enum(QtWidgets.QDialogButtonBox, "StandardButton", "Save")
             | qt_enum(QtWidgets.QDialogButtonBox, "StandardButton", "Cancel")
@@ -1475,7 +1500,11 @@ class SyncEngineController(QtCore.QObject):
             directory = self.store.change_projects_directory(path_edit.text())
             preferences["preview_show_full_target_path"] = show_full_path.isChecked()
             preferences["preview_target_path_depth"] = path_depth.value()
+            preferences["minimize_to_tray"] = minimize_to_tray.isChecked()
+            preferences["launch_in_compact_mode"] = launch_compact.isChecked()
             self.store.write_preferences(preferences)
+            self.view.window_manager.set_tray_enabled(preferences["minimize_to_tray"])
+            self.view.window_manager.start_compact = preferences["launch_in_compact_mode"]
             self.view.set_preview_preferences(
                 show_full_target_path=preferences["preview_show_full_target_path"],
                 path_depth=preferences["preview_target_path_depth"],
@@ -1531,7 +1560,7 @@ class SyncEngineController(QtCore.QObject):
             return
         preferences = self.store.read_preferences()
         preferences["last_plan_id"] = self.plan["id"]
-        preferences["geometry"] = bytes(self.view.saveGeometry().toBase64()).decode("ascii")
+        preferences["geometry"] = bytes(self.view.window_manager.saved_geometry().toBase64()).decode("ascii")
         try:
             self.store.write_preferences(preferences)
         except OSError:
